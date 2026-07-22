@@ -1,19 +1,19 @@
 @import "tailwindcss";
 
 :root {
-  --background: #050506;
+  --background: #08080c;
   --foreground: #f3f4f6;
-  
-  /* Primary variables */
-  --card-bg: rgba(18, 18, 20, 0.6);
-  --card-border: rgba(255, 255, 255, 0.05);
-  --accent-color: #10b981; /* emerald-500 */
+  --card-bg: rgba(16, 16, 22, 0.7);
+  --card-border: rgba(255, 255, 255, 0.06);
+  --sidebar-bg: #0c0c10;
+  --topbar-bg: rgba(8, 8, 12, 0.85);
+  --accent: #6366f1;
+  --accent-light: #818cf8;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  
   --color-neutral-850: #1a1a1f;
   --color-neutral-925: #0b0b0d;
 }
@@ -25,29 +25,46 @@ body {
   overflow-x: hidden;
 }
 
-/* Glassmorphism custom classes */
-.glass-panel {
+/* Card system */
+.cm-card {
   background: var(--card-bg);
-  backdrop-filter: blur(12px);
   border: 1px solid var(--card-border);
+  border-radius: 16px;
+  backdrop-filter: blur(12px);
 }
 
-.glass-panel-hover {
-  transition: all 0.2s ease-in-out;
+.cm-card-sm {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  backdrop-filter: blur(12px);
 }
-.glass-panel-hover:hover {
-  background: rgba(26, 26, 30, 0.8);
-  border-color: rgba(255, 255, 255, 0.1);
+
+/* Stat card hover effect */
+.stat-card {
+  transition: all 0.2s ease;
+}
+.stat-card:hover {
   transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 25px -5px rgba(0, 0, 0, 0.3);
 }
 
-/* Custom modern scrollbars */
+/* Table rows */
+.table-row {
+  transition: background 0.15s ease;
+}
+.table-row:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* Scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 ::-webkit-scrollbar-track {
-  background: #09090b;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: #27272a;
@@ -55,4 +72,28 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #3f3f46;
+}
+
+/* Slide-in panel */
+.slide-panel {
+  animation: slideIn 0.2s ease-out;
+}
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Fade in */
+.fade-in {
+  animation: fadeIn 0.25s ease-out;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }

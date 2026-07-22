@@ -233,7 +233,8 @@ router.get('/clusters', async (req, res) => {
               'id', 'CM-' || co.id,
               'text', co.text,
               'status', co.status,
-              'created_at', co.created_at
+              'created_at', co.created_at,
+              'source_name', COALESCE(s.name, 'unknown')
             )
           ) FILTER (WHERE co.id IS NOT NULL),
           '[]'::json
@@ -244,6 +245,7 @@ router.get('/clusters', async (req, res) => {
         la.generated_at as "latestActionGeneratedAt"
       FROM cluster cl
       LEFT JOIN complaint co ON cl.id = co.cluster_id
+      LEFT JOIN source s ON co.source_id = s.id
       LEFT JOIN LATERAL (
         SELECT action_text, generated_by, status, generated_at
         FROM recommended_action

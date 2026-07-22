@@ -5,6 +5,7 @@ import { env } from './config/env';
 import healthRouter from './routes/health';
 import complaintsRouter from './routes/complaints';
 import authRouter from './routes/auth';
+import ingestRouter from './routes/ingest';
 import { seedDatabaseIfEmpty } from './config/seed';
 
 const app = express();
@@ -24,6 +25,7 @@ app.use(express.json());
 app.use(healthRouter);
 app.use('/api', authRouter);
 app.use('/api', complaintsRouter);
+app.use('/api', ingestRouter);
 
 // Centralized error handling middleware
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {

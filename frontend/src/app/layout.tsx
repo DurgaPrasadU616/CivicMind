@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 import { AppContextProvider } from '../context/AppContext';
 import { AuthContextProvider } from '../context/AuthContext';
-import { Navbar } from '../components/Navbar';
+import { AppShell } from '../components/AppShell';
 
 export const metadata: Metadata = {
   title: 'CivicMind AI - Smart Ingestion & Dashboard',
@@ -19,12 +19,12 @@ export default function RootLayout({
       lang="en"
       className="h-full antialiased dark"
       style={{ colorScheme: 'dark' }}
+      suppressHydrationWarning
     >
-      <body className="min-h-full flex flex-col bg-neutral-950 text-neutral-100 selection:bg-emerald-500/20 selection:text-emerald-300">
+      <body className="min-h-full bg-[#08080c] text-neutral-100 selection:bg-indigo-500/20 selection:text-indigo-300" suppressHydrationWarning>
         <AuthContextProvider>
           <AppContextProvider>
-            <Navbar />
-            <main className="flex-1 flex flex-col">{children}</main>
+            <AppShell>{children}</AppShell>
           </AppContextProvider>
         </AuthContextProvider>
       </body>
