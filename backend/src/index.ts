@@ -22,6 +22,9 @@ app.use(
 app.use(express.json());
 
 // Routes
+app.get('/', (req, res) => {
+  res.json({ message: 'CivicMind API is running' });
+});
 app.use(healthRouter);
 app.use('/api', authRouter);
 app.use('/api', complaintsRouter);

@@ -1,6 +1,15 @@
-# CivicMind AI
+# CivicMind AI 🏛️🧠
+
+![Next.js](https://img.shields.io/badge/Next.js-black?style=for-the-badge&logo=next.js&logoColor=white)
+![Express.js](https://img.shields.io/badge/Express.js-000000?style=for-the-badge&logo=express&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white)
+![Gemini](https://img.shields.io/badge/Google_Gemini-8E75B2?style=for-the-badge&logo=google&logoColor=white)
+![Vercel](https://img.shields.io/badge/Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white)
 
 **AI Platform for Civic Issue Discovery, Prioritization, and Resolution**
+
+🚀 **Live Demo:** [https://aicivilmind.vercel.app/](https://aicivilmind.vercel.app/)  
+⚙️ **Live API:** [https://civilmindapi.vercel.app/](https://civilmindapi.vercel.app/)
 
 CivicMind AI is a civic intelligence platform designed to help municipal governments and non-governmental organizations (NGOs) detect community problems before they escalate. By unifying citizen reporting channels, news feeds, and simulated social signals, CivicMind AI leverages vector embeddings, deterministic severity formulas, and large language models (LLMs) to automatically cluster, rank, and recommend solutions for civic issues.
 
