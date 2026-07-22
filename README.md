@@ -13,8 +13,9 @@
 
 CivicMind AI is a civic intelligence platform designed to help municipal governments and non-governmental organizations (NGOs) detect community problems before they escalate. By unifying citizen reporting channels, news feeds, and simulated social signals, CivicMind AI leverages vector embeddings, deterministic severity formulas, and large language models (LLMs) to automatically cluster, rank, and recommend solutions for civic issues.
 
-![Dashboard Screenshot](./screenshots/dashboard.png)
-<!-- Demo note: Replace with high-resolution screenshot or animated overview of the multi-role dashboard -->
+![Login Page](./screenshots/login.png)
+<!-- To add a dashboard screenshot, save your image as 'dashboard.png' in the 'screenshots' folder and uncomment the line below -->
+<!-- ![Dashboard Screenshot](./screenshots/dashboard.png) -->
 
 ---
 
