@@ -3,7 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiClient, ApiError } from '../../lib/api';
-import { MapPin, Send, AlertTriangle, CheckCircle2, RefreshCw, WifiOff, FileText, Info } from 'lucide-react';
+import { MapPin, Send, AlertTriangle, CheckCircle2, RefreshCw, WifiOff, FileText } from 'lucide-react';
 
 export default function PortalPage() {
   const router = useRouter();
@@ -17,11 +17,11 @@ export default function PortalPage() {
   const [idempotencyKey, setIdempotencyKey] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitSuccess, setSubmitSuccess] = useState<any>(null);
+  const [submitSuccess, setSubmitSuccess] = useState<{ category?: string; text?: string; complaintId?: string; id?: string } | null>(null);
   const [networkErrorCount, setNetworkErrorCount] = useState(0);
 
   useEffect(() => {
-    if (typeof window !== 'undefined') setIdempotencyKey(crypto.randomUUID());
+    if (typeof window !== 'undefined') queueMicrotask(() => setIdempotencyKey(crypto.randomUUID()));
   }, [submitSuccess]);
 
   const handleGetLocation = () => {
@@ -66,10 +66,11 @@ export default function PortalPage() {
         idempotencyKey,
         metaData: { contactName: contactName.trim() || undefined, contactEmail: contactEmail.trim() || undefined },
       });
-      setSubmitSuccess(result.data);
+      const data = result.data as { category?: string; text?: string; complaintId?: string; id?: string };
+      setSubmitSuccess(data);
       setNetworkErrorCount(0);
       setErrors({});
-      setTimeout(() => router.push(`/track?id=${result.data.id}`), 2500);
+      setTimeout(() => router.push(`/track?id=${data.id || data.complaintId || ''}`), 2500);
     } catch (err) {
       if (err instanceof ApiError) {
         if (err.status === 409) setErrors({ duplicate: err.message });
@@ -122,7 +123,7 @@ export default function PortalPage() {
                   <span>Category</span>
                   <span className="font-semibold uppercase text-neutral-200">{submitSuccess.category}</span>
                 </div>
-                <p className="text-sm text-neutral-300 italic line-clamp-2">"{submitSuccess.text}"</p>
+                <p className="text-sm text-neutral-300 italic line-clamp-2">&quot;{submitSuccess?.text}&quot;</p>
               </div>
               <p className="text-xs text-neutral-500 animate-pulse mb-4">Redirecting to tracker...</p>
               <button onClick={handleReset} className="px-4 py-2 bg-white/5 border border-white/5 text-neutral-300 hover:text-white rounded-xl text-sm transition-all cursor-pointer">
@@ -170,7 +171,7 @@ export default function PortalPage() {
 
               <div>
                 <label className="block text-xs font-semibold text-neutral-400 mb-1.5">Category <span className="text-rose-500">*</span></label>
-                <select value={category} onChange={(e) => setCategory(e.target.value as any)} className="w-full px-4 py-3 bg-white/[0.03] border border-white/[0.06] rounded-xl text-sm text-white focus:outline-none focus:border-indigo-500/40 transition-all">
+                <select value={category} onChange={(e) => setCategory(e.target.value as 'infrastructure' | 'sanitation' | 'utility' | 'noise' | 'safety' | 'other')} className="w-full px-4 py-3 bg-white/[0.03] border border-white/[0.06] rounded-xl text-sm text-white focus:outline-none focus:border-indigo-500/40 transition-all">
                   <option value="infrastructure">Infrastructure (Roads, Bridges)</option>
                   <option value="sanitation">Sanitation (Garbage, Drainage)</option>
                   <option value="utility">Utility (Water, Power, Streetlights)</option>

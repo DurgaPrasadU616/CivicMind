@@ -8,7 +8,8 @@ export const registerSchema = z.object({
     .string()
     .min(8, 'Password must be at least 8 characters')
     .regex(/\d/, 'Password must contain at least one number'),
-  role: z.enum(['citizen', 'ngo', 'govt', 'admin']).default('citizen'),
+  role: z.enum(['citizen', 'ngo', 'govt', 'admin', 'service_account']).default('citizen'),
+  is_service_account: z.boolean().optional(),
 });
 
 export const loginSchema = z.object({

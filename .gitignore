@@ -32,3 +32,11 @@ Thumbs.db
 
 # Jest cache
 .jest-cache/
+
+# Test coverage
+coverage/
+
+# AI Artifacts
+task.md
+walkthrough.md
+implementation_plan.md

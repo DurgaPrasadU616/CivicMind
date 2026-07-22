@@ -1,18 +1,55 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { apiClient } from '../../lib/api';
 import {
   TrendingUp, CheckCircle2, AlertOctagon, Landmark,
-  Map, List, Search, ArrowUpDown, FileText, Calendar,
+  Map, List, Search, ArrowUpDown,
   RefreshCw, AlertTriangle, Loader2, Bot, Zap, ChevronRight,
   X, Activity
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
+import { IngestionHistoryPanel } from '../../components/IngestionHistoryPanel';
+
+interface ComplaintItem {
+  id: string | number;
+  status: string;
+  text: string;
+  created_at: string;
+  source_name?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  [key: string]: unknown;
+}
+
+interface ClusterItem {
+  id: string | number;
+  title: string;
+  category: string;
+  region: string;
+  complaintCount: number;
+  severity: number;
+  priorityScore?: number;
+  status: string;
+  recommendedAction?: string;
+  actionSource?: string;
+  lastUpdated?: string;
+  complaints: ComplaintItem[];
+  latitude?: number | null;
+  longitude?: number | null;
+  latestAction?: {
+    generatedBy?: string;
+    text?: string;
+    generatedAt?: string | number | Date;
+  } | null;
+  [key: string]: unknown;
+}
+
 export default function DashboardPage() {
   const { userRole, user } = useAuth();
+
 
   const [viewMode, setViewMode] = useState<'table' | 'map'>('table');
   const [searchQuery, setSearchQuery] = useState('');
@@ -23,7 +60,7 @@ export default function DashboardPage() {
   const [sortBy, setSortBy] = useState<'priority' | 'severity' | 'count'>('priority');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
 
-  const [clusters, setClusters] = useState<any[]>([]);
+  const [clusters, setClusters] = useState<ClusterItem[]>([]);
   const [globalStats, setGlobalStats] = useState({ totalOpen: 0, totalResolved: 0, avgSeverity: 0, topRegion: 'N/A' });
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
@@ -35,15 +72,15 @@ export default function DashboardPage() {
     return { x, y };
   };
 
-  const loadGlobalStats = async () => {
+  const loadGlobalStats = useCallback(async () => {
     try {
       const res = await apiClient.getClusters();
-      const allCls = res.data;
+      const allCls = res.data as ClusterItem[];
       let openCount = 0, resolvedCount = 0, severitySum = 0, activeClCount = 0;
       const regionCounts: Record<string, number> = {};
-      allCls.forEach((c: any) => {
+      allCls.forEach((c) => {
         if (c.status !== 'resolved') { openCount += c.complaintCount; severitySum += c.severity; activeClCount++; }
-        resolvedCount += c.complaints.filter((comp: any) => comp.status === 'resolved').length;
+        resolvedCount += (c.complaints || []).filter((comp) => comp.status === 'resolved').length;
         regionCounts[c.region] = (regionCounts[c.region] || 0) + c.complaintCount;
       });
       const avgSeverity = activeClCount > 0 ? Math.round(severitySum / activeClCount) : 0;
@@ -51,17 +88,18 @@ export default function DashboardPage() {
       Object.entries(regionCounts).forEach(([region, count]) => { if (count > maxCount) { maxCount = count; topRegion = region; } });
       setGlobalStats({ totalOpen: openCount, totalResolved: resolvedCount, avgSeverity, topRegion });
     } catch (err) { console.error('Failed to load global stats:', err); }
-  };
+  }, []);
 
-  const fetchFilteredClusters = async () => {
+  const fetchFilteredClusters = useCallback(async () => {
     setIsLoading(true);
     setErrorMsg('');
     try {
       const res = await apiClient.getClusters({ category: filterCategory, region: filterRegion, status: filterStatus, search: searchQuery });
-      setClusters(res.data);
-      if (res.data.length > 0) {
-        const stillExists = res.data.some((c: any) => c.id === selectedClusterId);
-        if (!stillExists) setSelectedClusterId(res.data[0].id);
+      const cls = res.data as ClusterItem[];
+      setClusters(cls);
+      if (cls.length > 0) {
+        const stillExists = cls.some((c) => String(c.id) === String(selectedClusterId));
+        if (!stillExists) setSelectedClusterId(String(cls[0].id));
       } else {
         setSelectedClusterId(null);
       }
@@ -71,22 +109,22 @@ export default function DashboardPage() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [filterCategory, filterRegion, filterStatus, searchQuery, selectedClusterId]);
 
   useEffect(() => {
     const t = setTimeout(() => { fetchFilteredClusters(); loadGlobalStats(); }, 300);
     return () => clearTimeout(t);
-  }, [filterCategory, filterRegion, filterStatus, searchQuery]);
+  }, [fetchFilteredClusters, loadGlobalStats]);
 
   const handleUpdateStatus = async (newStatus: 'pending' | 'in_progress' | 'resolved') => {
     if (!selectedClusterId) return;
     try {
       await apiClient.updateClusterStatus(selectedClusterId, newStatus);
-      setClusters(prev => prev.map(c => c.id === selectedClusterId ? { ...c, status: newStatus } : c));
+      setClusters(prev => prev.map(c => String(c.id) === String(selectedClusterId) ? { ...c, status: newStatus } : c));
       loadGlobalStats();
-    } catch (err: any) {
-      if (err?.status === 403) setErrorMsg('Permission denied. Only NGO/Govt/Admin accounts can update cluster status.');
-      else if (err?.status !== 401) setErrorMsg(err?.message || 'Error updating cluster status.');
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'status' in err && (err as { status?: number }).status === 403) setErrorMsg('Permission denied. Only NGO/Govt/Admin accounts can update cluster status.');
+      else if (err && typeof err === 'object' && 'status' in err && (err as { status?: number }).status !== 401) setErrorMsg(err instanceof Error ? err.message : 'Error updating cluster status.');
     }
   };
 
@@ -96,14 +134,17 @@ export default function DashboardPage() {
   };
 
   const sortedClusters = useMemo(() => {
-    return [...clusters].sort((a, b) => {
-      const valA = sortBy === 'priority' ? (a.priorityScore ?? a.severity) : sortBy === 'severity' ? a.severity : a.complaintCount;
-      const valB = sortBy === 'priority' ? (b.priorityScore ?? b.severity) : sortBy === 'severity' ? b.severity : b.complaintCount;
+    const copy = [...clusters];
+    return copy.sort((a, b) => {
+      let valA = 0, valB = 0;
+      if (sortBy === 'priority') { valA = a.priorityScore ?? a.severity; valB = b.priorityScore ?? b.severity; }
+      else if (sortBy === 'severity') { valA = a.severity; valB = b.severity; }
+      else if (sortBy === 'count') { valA = a.complaintCount; valB = b.complaintCount; }
       return sortOrder === 'asc' ? valA - valB : valB - valA;
     });
   }, [clusters, sortBy, sortOrder]);
 
-  const selectedCluster = useMemo(() => clusters.find((c) => c.id === selectedClusterId) || null, [clusters, selectedClusterId]);
+  const selectedCluster = useMemo(() => clusters.find((c) => String(c.id) === String(selectedClusterId)) || null, [clusters, selectedClusterId]);
 
   // Chart data — group complaints by category
   const chartData = useMemo(() => {
@@ -216,7 +257,13 @@ export default function DashboardPage() {
         })}
       </div>
 
+      {/* Admin / Govt Ingestion Audit Panel */}
+      {(userRole === 'admin' || userRole === 'govt') && (
+        <IngestionHistoryPanel />
+      )}
+
       {/* Chart + Filters Row */}
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Bar Chart */}
         <div className="cm-card p-5">
@@ -337,8 +384,8 @@ export default function DashboardPage() {
                   {sortedClusters.length > 0 ? sortedClusters.map((cluster) => (
                     <tr
                       key={cluster.id}
-                      onClick={() => setSelectedClusterId(cluster.id === selectedClusterId ? null : cluster.id)}
-                      className={`table-row border-b border-white/[0.03] cursor-pointer ${selectedClusterId === cluster.id ? 'bg-indigo-500/5' : ''}`}
+                      onClick={() => setSelectedClusterId(String(cluster.id) === String(selectedClusterId) ? null : String(cluster.id))}
+                      className={`table-row border-b border-white/[0.03] cursor-pointer ${String(selectedClusterId) === String(cluster.id) ? 'bg-indigo-500/5' : ''}`}
                     >
                       <td className="px-5 py-4">
                         <div className="font-semibold text-white text-[13px]">{cluster.title}</div>
@@ -391,13 +438,13 @@ export default function DashboardPage() {
                     <text x="130" y="220" className="fill-indigo-500/60 text-[11px]">Downtown</text>
                   </g>
                   {sortedClusters.map((cluster) => {
-                    const { x, y } = getCoordinates(cluster.latitude, cluster.longitude);
-                    const isSelected = selectedClusterId === cluster.id;
+                    const { x, y } = getCoordinates(Number(cluster.latitude || 12.9716), Number(cluster.longitude || 77.5946));
+                    const isSelected = String(selectedClusterId) === String(cluster.id);
                     let color = 'fill-emerald-500';
                     if (cluster.severity >= 75) color = 'fill-rose-500';
                     else if (cluster.severity >= 40) color = 'fill-amber-500';
                     return (
-                      <g key={cluster.id} onClick={() => setSelectedClusterId(cluster.id)} className="cursor-pointer group">
+                      <g key={cluster.id} onClick={() => setSelectedClusterId(String(cluster.id))} className="cursor-pointer group">
                         {isSelected && <circle cx={x} cy={y} r="14" className="fill-none stroke-white/50 stroke-2 animate-pulse" />}
                         <circle cx={x} cy={y} r="18" className="fill-white/0 group-hover:fill-white/5 transition-all" />
                         <circle cx={x} cy={y} r="8" className={`${color} opacity-30 group-hover:opacity-50`} />
@@ -472,13 +519,13 @@ export default function DashboardPage() {
                 Reports ({selectedCluster.complaints.length})
               </span>
               <div className="max-h-40 overflow-y-auto space-y-2 pr-1">
-                {selectedCluster.complaints.map((c: any) => (
+                {selectedCluster.complaints.map((c: ComplaintItem) => (
                   <div key={c.id} className="p-3 bg-white/[0.02] border border-white/5 rounded-xl">
                     <div className="flex items-center justify-between mb-1 text-[10px]">
                       <span className="font-mono font-bold text-indigo-400">{c.id}</span>
                       <span className="text-neutral-600">{new Date(c.created_at).toLocaleDateString()}</span>
                     </div>
-                    <p className="text-[11px] text-neutral-300 leading-normal line-clamp-2">"{c.text}"</p>
+                    <p className="text-[11px] text-neutral-300 leading-normal line-clamp-2">&quot;{c.text}&quot;</p>
                     <div className="flex items-center justify-between mt-1.5 pt-1.5 border-t border-white/5 text-[9px] text-neutral-500">
                       <span className="capitalize">{c.status}</span>
                       {c.source_name && (
@@ -498,7 +545,7 @@ export default function DashboardPage() {
             <div className="mb-5">
               <div className="flex items-center gap-2 mb-3">
                 <span className="text-[11px] uppercase font-bold text-neutral-500 tracking-wider">AI Action Plan</span>
-                {selectedCluster.latestAction && (
+                {!!selectedCluster.latestAction && (
                   <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-bold uppercase tracking-wider border ${
                     selectedCluster.latestAction.generatedBy === 'gemini'
                       ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
@@ -521,7 +568,7 @@ export default function DashboardPage() {
                     </p>
                   </div>
                   <div className="text-[9px] text-neutral-600 font-mono mt-2 pt-2 border-t border-indigo-500/10">
-                    {new Date(selectedCluster.latestAction.generatedAt).toLocaleString()}
+                    {new Date(selectedCluster.latestAction.generatedAt || Date.now()).toLocaleString()}
                   </div>
                 </div>
               ) : selectedCluster.recommendedAction ? (

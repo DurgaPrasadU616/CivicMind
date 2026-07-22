@@ -243,7 +243,7 @@ export const AppContextProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   useEffect(() => {
     const savedRole = localStorage.getItem('civicmind_role');
     if (savedRole) {
-      setUserRole(savedRole as UserRole);
+      queueMicrotask(() => setUserRole(savedRole as UserRole));
     }
   }, []);
 

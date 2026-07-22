@@ -5,12 +5,35 @@ import { useSearchParams, useRouter } from 'next/navigation';
 import { apiClient, ApiError } from '../../lib/api';
 import { Search, MapPin, Calendar, AlertTriangle, FileText, CheckCircle2, Clock, RefreshCw, HelpCircle, ChevronDown } from 'lucide-react';
 
+interface ComplaintDetail {
+  id: string | number;
+  clusterId?: string | number | null;
+  status: string;
+  text: string;
+  category: string;
+  created_at: string;
+  latitude?: string | number | null;
+  longitude?: string | number | null;
+  [key: string]: unknown;
+}
+
+interface ClusterDetail {
+  id: string | number;
+  title: string;
+  complaintCount: number;
+  region: string;
+  severity: number;
+  recommendedAction?: string;
+  complaints?: Array<{ id: string | number }>;
+  [key: string]: unknown;
+}
+
 function TrackContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const [searchId, setSearchId] = useState('');
-  const [selectedComplaint, setSelectedComplaint] = useState<any>(null);
-  const [linkedCluster, setLinkedCluster] = useState<any>(null);
+  const [selectedComplaint, setSelectedComplaint] = useState<ComplaintDetail | null>(null);
+  const [linkedCluster, setLinkedCluster] = useState<ClusterDetail | null>(null);
   const [recentIds, setRecentIds] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
@@ -20,9 +43,9 @@ function TrackContent() {
       try {
         const res = await apiClient.getClusters();
         const ids: string[] = [];
-        res.data.forEach((cluster: any) => {
-          cluster.complaints.forEach((comp: any) => {
-            if (!ids.includes(comp.id)) ids.push(comp.id);
+        (res.data as ClusterDetail[]).forEach((cluster) => {
+          (cluster.complaints || []).forEach((comp) => {
+            if (!ids.includes(String(comp.id))) ids.push(String(comp.id));
           });
         });
         setRecentIds(ids.sort());
@@ -36,11 +59,12 @@ function TrackContent() {
     setErrorMsg('');
     try {
       const compRes = await apiClient.getComplaint(id);
-      setSelectedComplaint(compRes.data);
-      if (compRes.data.clusterId) {
+      const compData = compRes.data as ComplaintDetail;
+      setSelectedComplaint(compData);
+      if (compData.clusterId) {
         try {
           const clustersRes = await apiClient.getClusters();
-          const match = clustersRes.data.find((c) => c.id === compRes.data.clusterId);
+          const match = (clustersRes.data as ClusterDetail[]).find((c) => String(c.id) === String(compData.clusterId));
           setLinkedCluster(match || null);
         } catch { setLinkedCluster(null); }
       } else { setLinkedCluster(null); }
@@ -54,7 +78,12 @@ function TrackContent() {
 
   useEffect(() => {
     const idParam = searchParams.get('id');
-    if (idParam) { setSearchId(idParam); fetchComplaintDetails(idParam); }
+    if (idParam) {
+      queueMicrotask(() => {
+        setSearchId(idParam);
+        fetchComplaintDetails(idParam);
+      });
+    }
   }, [searchParams]);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
@@ -174,7 +203,7 @@ function TrackContent() {
                 <FileText className="w-3.5 h-3.5 text-indigo-400" /> Description
               </h3>
               <p className="text-sm text-neutral-300 leading-relaxed bg-white/[0.02] p-4 rounded-xl border border-white/5 italic">
-                "{selectedComplaint.text}"
+                &quot;{selectedComplaint.text}&quot;
               </p>
               <div className="grid grid-cols-2 gap-3 text-xs">
                 <div className="bg-white/[0.02] p-3 rounded-lg border border-white/5">
@@ -193,7 +222,7 @@ function TrackContent() {
                 <div className="bg-white/[0.02] p-3 rounded-lg border border-white/5 text-xs flex justify-between items-center">
                   <div>
                     <span className="text-neutral-500 text-[10px] font-semibold block">GPS Coordinates</span>
-                    <span className="font-mono text-neutral-300">{parseFloat(selectedComplaint.latitude).toFixed(6)}, {parseFloat(selectedComplaint.longitude).toFixed(6)}</span>
+                    <span className="font-mono text-neutral-300">{Number(selectedComplaint.latitude).toFixed(6)}, {Number(selectedComplaint.longitude).toFixed(6)}</span>
                   </div>
                   <MapPin className="w-4 h-4 text-indigo-400" />
                 </div>

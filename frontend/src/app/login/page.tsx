@@ -31,8 +31,8 @@ export default function LoginPage() {
     try {
       if (mode === 'login') await login(email, password);
       else await register(name, email, password, role);
-    } catch (err: any) {
-      setError(err.message || 'Something went wrong.');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : typeof err === 'object' && err !== null && 'message' in err ? String((err as { message: unknown }).message) : 'Something went wrong.');
     } finally {
       setLoading(false);
     }

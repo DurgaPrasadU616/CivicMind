@@ -18,8 +18,6 @@ export class ApiError extends Error {
 }
 
 // ─── Token accessor ──────────────────────────────────────────────────────────
-// api.ts cannot use React hooks, so AuthContext registers a getter here.
-// This is the standard pattern for injecting auth tokens into a plain module.
 let _getToken: (() => string | null) | null = null;
 let _onUnauthorized: (() => void) | null = null;
 
@@ -55,7 +53,6 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
-      // 401 → token expired or missing — redirect to login
       if (response.status === 401 && _onUnauthorized) {
         _onUnauthorized();
       }
@@ -68,12 +65,24 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     if (error instanceof ApiError) {
       throw error;
     }
-    // Network or parser failures
     throw new ApiError(
       error instanceof Error ? error.message : 'Unable to connect to the backend server.',
       503
     );
   }
+}
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+export interface IngestionLogItem {
+  id: number;
+  source_type: string;
+  run_at: string;
+  processed: number;
+  created: number;
+  duplicates: number;
+  errors: number;
+  failed_feeds: string[] | null;
+  status: 'success' | 'partial' | 'failed';
 }
 
 // ─── Auth API ─────────────────────────────────────────────────────────────────
@@ -93,27 +102,24 @@ export const authApi = {
 
 // ─── Main API client ──────────────────────────────────────────────────────────
 export const apiClient = {
-  // Submit a complaint
   submitComplaint: async (payload: {
     text: string;
     category: string;
     latitude: number | null;
     longitude: number | null;
     idempotencyKey: string;
-    metaData?: Record<string, any>;
+    metaData?: Record<string, unknown>;
   }) => {
-    return request<{ message: string; data: any }>('/api/complaints', {
+    return request<{ message: string; data: unknown }>('/api/complaints', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
   },
 
-  // Fetch a specific complaint status
   getComplaint: async (id: string) => {
-    return request<{ data: any }>(`/api/complaints/${id}`);
+    return request<{ data: unknown }>(`/api/complaints/${id}`);
   },
 
-  // Fetch aggregated clusters lists
   getClusters: async (filters?: {
     category?: string;
     region?: string;
@@ -129,10 +135,9 @@ export const apiClient = {
       });
     }
     const query = params.toString() ? `?${params.toString()}` : '';
-    return request<{ data: any[] }>(`/api/clusters${query}`);
+    return request<{ data: unknown[] }>(`/api/clusters${query}`);
   },
 
-  // Update status of a cluster (cascades to complaints) — requires ngo/govt/admin JWT
   updateClusterStatus: async (clusterId: string, status: 'pending' | 'in_progress' | 'resolved') => {
     return request<{ message: string; clusterId: string }>(`/api/clusters/${clusterId}/status`, {
       method: 'POST',
@@ -140,7 +145,6 @@ export const apiClient = {
     });
   },
 
-  // Fetch the recommended action history for a cluster
   getClusterActions: async (clusterId: string) => {
     return request<{ clusterId: string; data: Array<{
       id: number;
@@ -149,5 +153,11 @@ export const apiClient = {
       status: 'active' | 'superseded';
       generated_at: string;
     }> }>(`/api/clusters/${clusterId}/actions`);
+  },
+
+  getIngestionLogs: async (limit = 10, page = 1) => {
+    return request<{ logs: IngestionLogItem[]; total: number; page: number; limit: number; totalPages: number }>(
+      `/api/ingestion/log?limit=${limit}&page=${page}`
+    );
   },
 };

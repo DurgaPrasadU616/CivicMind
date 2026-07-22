@@ -3,25 +3,11 @@
 // SIMULATED social media ingestion — generates realistic mock civic-complaint
 // posts that mimic what a live Twitter/X or Facebook API integration would
 // produce. This is NOT connected to a real social media API.
-//
-// ── Why simulated? ─────────────────────────────────────────────────────────
-// Live Twitter/X API access requires a paid Basic ($100/mo) or Pro ($5000/mo)
-// tier. For a demo, portfolio, or interview setting, a mock dataset is
-// transparent and sufficient to prove the pipeline works end-to-end.
-// When a paid API key is available, replace this file with real API calls
-// and keep the same insertAndCluster() pipeline.
-//
-// ── Pipeline ────────────────────────────────────────────────────────────────
-// Each mock post is inserted via insertAndCluster() from common.ts, which
-// handles dedup (ON CONFLICT idempotency_key), embedding, clustering, and
-// severity scoring — exactly the same path used by citizen_portal and
-// news_rss ingestion.
+// Writes audit records to ingestion_log table after every run.
 
 import { getSourceId, generateIdempotencyKey, insertAndCluster } from './common';
+import { logIngestionRun } from './ingestionLogService';
 
-// ── Mock social media post dataset ──────────────────────────────────────────
-// 20 realistic civic complaint posts across multiple categories and regions.
-// Each post has author, platform, text, optional location, and timestamp.
 interface MockSocialPost {
   author: string;
   platform: string;
@@ -184,7 +170,6 @@ const MOCK_POSTS: MockSocialPost[] = [
   },
 ];
 
-// ── Category inference (same logic as newsIngestion, kept independent) ──────
 const CATEGORY_RULES: Array<{ keywords: string[]; category: string }> = [
   { keywords: ['road', 'pothole', 'traffic', 'bridge', 'construction', 'bus', 'metro', 'transport', 'footpath', 'pavement', 'encroachment', 'pedestrian', 'flyover', 'resurface'], category: 'infrastructure' },
   { keywords: ['garbage', 'waste', 'drainage', 'sewage', 'pollution', 'litter', 'sanitation', 'overflow', 'plastic', 'dump'], category: 'sanitation' },
@@ -203,8 +188,6 @@ const inferCategory = (text: string): string => {
   return 'other';
 };
 
-// ── Region mapping for mock posts ───────────────────────────────────────────
-// Maps our region labels to approximate GPS center coordinates for Bangalore.
 const REGION_COORDS: Record<string, { lat: number; lng: number }> = {
   Downtown: { lat: 12.9716, lng: 77.5946 },
   North:    { lat: 12.9850, lng: 77.5900 },
@@ -213,31 +196,45 @@ const REGION_COORDS: Record<string, { lat: number; lng: number }> = {
   West:     { lat: 12.9750, lng: 77.5650 },
 };
 
-// ── Main ingestion entry point ──────────────────────────────────────────────
 export interface SocialIngestionResult {
   totalPosts: number;
   insertedCount: number;
   skippedDuplicate: number;
   errors: string[];
+  status: 'success' | 'partial' | 'failed';
+  logId?: number | null;
 }
 
-export const ingestSocialMediaPosts = async (): Promise<SocialIngestionResult> => {
+export const ingestSocialMediaPosts = async (posts?: MockSocialPost[]): Promise<SocialIngestionResult> => {
+  const postsToUse = posts ?? MOCK_POSTS;
+
   const result: SocialIngestionResult = {
-    totalPosts: MOCK_POSTS.length,
+    totalPosts: postsToUse.length,
     insertedCount: 0,
     skippedDuplicate: 0,
     errors: [],
+    status: 'success',
   };
 
   const sourceId = await getSourceId('social_media');
   if (!sourceId) {
-    result.errors.push('Source "social_media" not found in database.');
+    const errMsg = 'Source "social_media" not found in database.';
+    result.errors.push(errMsg);
+    result.status = 'failed';
+    result.logId = await logIngestionRun({
+      sourceType: 'social_media',
+      processed: 0,
+      created: 0,
+      duplicates: 0,
+      errors: 1,
+      status: 'failed',
+    });
     return result;
   }
 
-  console.log(`[SOCIAL] Ingesting ${MOCK_POSTS.length} simulated social media posts...`);
+  console.log(`[SOCIAL] Ingesting ${postsToUse.length} simulated social media posts...`);
 
-  for (const post of MOCK_POSTS) {
+  for (const post of postsToUse) {
     const category = inferCategory(post.text);
     const idempotencyKey = generateIdempotencyKey(`${post.platform}:${post.author}:${post.postedAt}`);
     const region = post.region ?? 'Downtown';
@@ -256,7 +253,7 @@ export const ingestSocialMediaPosts = async (): Promise<SocialIngestionResult> =
           platform: post.platform,
           author: post.author,
           postedAt: post.postedAt,
-          simulated: true, // Transparent: this is mock data
+          simulated: true,
         },
       });
 
@@ -270,9 +267,26 @@ export const ingestSocialMediaPosts = async (): Promise<SocialIngestionResult> =
     }
   }
 
+  if (result.errors.length === postsToUse.length && postsToUse.length > 0) {
+    result.status = 'failed';
+  } else if (result.errors.length > 0) {
+    result.status = 'partial';
+  } else {
+    result.status = 'success';
+  }
+
+  result.logId = await logIngestionRun({
+    sourceType: 'social_media',
+    processed: postsToUse.length,
+    created: result.insertedCount,
+    duplicates: result.skippedDuplicate,
+    errors: result.errors.length,
+    status: result.status,
+  });
+
   console.log(
-    `[SOCIAL] Ingestion complete: ${result.insertedCount} new, ` +
-    `${result.skippedDuplicate} duplicate-skipped out of ${result.totalPosts} mock posts`
+    `[SOCIAL] Ingestion complete (status: ${result.status}): ${result.insertedCount} new, ` +
+    `${result.skippedDuplicate} duplicate-skipped out of ${result.totalPosts} posts`
   );
 
   return result;

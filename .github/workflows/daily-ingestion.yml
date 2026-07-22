@@ -1,0 +1,91 @@
+name: Daily Data Ingestion
+
+on:
+  schedule:
+    # Runs daily at 06:00 UTC (11:30 AM IST)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    name: Run News & Social Ingestion
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Authenticate Service Account
+        id: login
+        run: |
+          if [ -z "${{ secrets.BACKEND_URL }}" ] || [ -z "${{ secrets.SERVICE_ACCOUNT_EMAIL }}" ] || [ -z "${{ secrets.SERVICE_ACCOUNT_PASSWORD }}" ]; then
+            echo "❌ Required secrets (BACKEND_URL, SERVICE_ACCOUNT_EMAIL, SERVICE_ACCOUNT_PASSWORD) are missing."
+            exit 1
+          fi
+
+          echo "🔑 Authenticating service account against ${{ secrets.BACKEND_URL }}..."
+          
+          RESPONSE=$(curl -s -X POST "${{ secrets.BACKEND_URL }}/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"email\":\"${{ secrets.SERVICE_ACCOUNT_EMAIL }}\",\"password\":\"${{ secrets.SERVICE_ACCOUNT_PASSWORD }}\"}")
+
+          TOKEN=$(echo "$RESPONSE" | grep -o '"token":"[^"]*' | cut -d'"' -f4)
+
+          if [ -z "$TOKEN" ]; then
+            echo "❌ Service account authentication failed!"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "✅ Authentication successful."
+
+      - name: Ingest News RSS Feeds
+        run: |
+          echo "📰 Triggering News RSS ingestion..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ secrets.BACKEND_URL }}/api/ingest/news" \
+            -H "Authorization: Bearer ${{ env.TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Body: $BODY"
+          echo "HTTP Status Code: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ News RSS ingestion failed with HTTP $HTTP_CODE!"
+            exit 1
+          fi
+
+          STATUS=$(echo "$BODY" | grep -o '"status":"[^"]*' | cut -d'"' -f4)
+          if [ "$STATUS" = "failed" ]; then
+            echo "❌ News RSS ingestion internal status reported 'failed'!"
+            exit 1
+          fi
+
+          echo "✅ News RSS ingestion completed (status: $STATUS)."
+
+      - name: Ingest Simulated Social Media Posts
+        run: |
+          echo "📱 Triggering Social Media ingestion..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ secrets.BACKEND_URL }}/api/ingest/social" \
+            -H "Authorization: Bearer ${{ env.TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Body: $BODY"
+          echo "HTTP Status Code: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Social media ingestion failed with HTTP $HTTP_CODE!"
+            exit 1
+          fi
+
+          STATUS=$(echo "$BODY" | grep -o '"status":"[^"]*' | cut -d'"' -f4)
+          if [ "$STATUS" = "failed" ]; then
+            echo "❌ Social media ingestion internal status reported 'failed'!"
+            exit 1
+          fi
+
+          echo "✅ Social media ingestion completed (status: $STATUS)."

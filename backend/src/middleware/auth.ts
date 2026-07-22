@@ -11,7 +11,7 @@ import { env } from '../config/env';
 
 export interface JwtPayload {
   id: number;
-  role: 'citizen' | 'ngo' | 'govt' | 'admin';
+  role: 'citizen' | 'ngo' | 'govt' | 'admin' | 'service_account';
 }
 
 // Extend Express Request to include the decoded user
