@@ -24,7 +24,7 @@ const envSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(32).optional(),
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
   // Media Storage Configuration
-  MEDIA_STORAGE_PROVIDER: z.enum(['local', 'r2', 's3']).default('local'),
+  MEDIA_STORAGE_PROVIDER: z.enum(['local', 'r2', 's3', 'imagekit']).default('local'),
   MEDIA_STORAGE_DIR: z.string().default('./uploads'),
   // Cloudflare R2 / S3 Storage Credentials (required when MEDIA_STORAGE_PROVIDER is 'r2' or 's3')
   R2_ACCOUNT_ID: z.string().optional(),
@@ -32,6 +32,10 @@ const envSchema = z.object({
   R2_SECRET_ACCESS_KEY: z.string().optional(),
   R2_BUCKET_NAME: z.string().optional(),
   R2_PUBLIC_BASE_URL: z.string().url().optional(),
+  // ImageKit Credentials (required when MEDIA_STORAGE_PROVIDER is 'imagekit')
+  IMAGEKIT_PUBLIC_KEY: z.string().optional(),
+  IMAGEKIT_PRIVATE_KEY: z.string().optional(),
+  IMAGEKIT_URL_ENDPOINT: z.string().url().optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

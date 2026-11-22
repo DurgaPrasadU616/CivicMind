@@ -2,6 +2,7 @@ import {
   StorageProvider,
   LocalStorageProvider,
   S3StorageProvider,
+  ImageKitStorageProvider,
   validateStorageKey,
   getStorageProvider,
   _resetStorageProvider,
@@ -295,6 +296,289 @@ describe('S3StorageProvider (Cloudflare R2 Compatibility)', () => {
   });
 });
 
+describe('ImageKitStorageProvider', () => {
+  let mockFetch: jest.Mock;
+  let provider: ImageKitStorageProvider;
+
+  beforeEach(() => {
+    mockFetch = jest.fn();
+    provider = new ImageKitStorageProvider({
+      publicKey: 'test-public-key',
+      privateKey: 'test-private-key',
+      urlEndpoint: 'https://ik.imagekit.io/test-endpoint',
+      fetchFn: mockFetch as any,
+    });
+  });
+
+  it('validates required credentials and throws if missing', () => {
+    expect(() => {
+      new ImageKitStorageProvider({
+        publicKey: '',
+        privateKey: 'key',
+        urlEndpoint: 'https://ik.imagekit.io/endpoint',
+      });
+    }).toThrow(/Missing required ImageKit credentials/);
+
+    expect(() => {
+      new ImageKitStorageProvider({
+        publicKey: 'pub',
+        privateKey: '',
+        urlEndpoint: 'https://ik.imagekit.io/endpoint',
+      });
+    }).toThrow(/Missing required ImageKit credentials/);
+
+    expect(() => {
+      new ImageKitStorageProvider({
+        publicKey: 'pub',
+        privateKey: 'priv',
+        urlEndpoint: '',
+      });
+    }).toThrow(/Missing required ImageKit credentials/);
+  });
+
+  it('blocks path traversal on ImageKit storage operations', async () => {
+    await expect(provider.get('../../etc/passwd')).rejects.toThrow(/Path traversal blocked/);
+    await expect(provider.put('../outside.txt', Buffer.from('data'), 'text/plain')).rejects.toThrow(
+      /Path traversal blocked/
+    );
+    await expect(provider.delete('/root/secret')).rejects.toThrow(/Path traversal blocked/);
+    await expect(provider.exists('\\windows\\system32')).rejects.toThrow(/Path traversal blocked/);
+  });
+
+  it('puts object with correct endpoint, auth header, and FormData', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ fileId: 'img_123' }),
+    });
+
+    const key = 'complaints/101/image.png';
+    const buffer = Buffer.from('fake-image-bytes');
+
+    const result = await provider.put(key, buffer, 'image/png');
+    expect(result).toBe(key);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe('https://upload.imagekit.io/api/v1/files/upload');
+    expect(options.method).toBe('POST');
+    expect(options.headers.Authorization).toBe(
+      'Basic ' + Buffer.from('test-private-key:').toString('base64')
+    );
+    expect(options.body).toBeInstanceOf(FormData);
+  });
+
+  it('handles put error from ImageKit API', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      text: async () => 'Invalid file format',
+    });
+
+    await expect(
+      provider.put('complaints/101/bad.xyz', Buffer.from('bad'), 'application/xyz')
+    ).rejects.toThrow(/ImageKit upload failed with HTTP 400/);
+  });
+
+  it('gets object and returns byte buffer', async () => {
+    const fakeData = Buffer.from('imagekit-retrieved-bytes');
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => new Uint8Array(fakeData).buffer,
+    });
+
+    const key = 'complaints/101/image.png';
+    const result = await provider.get(key);
+
+    expect(result.equals(fakeData)).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const calledUrl = mockFetch.mock.calls[0][0];
+    expect(calledUrl).toContain('https://ik.imagekit.io/test-endpoint/complaints/101/image.png');
+    expect(calledUrl).toContain('ik-t=');
+    expect(calledUrl).toContain('ik-s=');
+  });
+
+  it('handles 404 in get by throwing ENOENT', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+    });
+
+    await expect(provider.get('missing/key.jpg')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('checks object existence via exists()', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [
+        {
+          fileId: 'file_1',
+          name: 'image.png',
+          filePath: '/complaints/101/image.png',
+        },
+      ],
+    });
+
+    const exists = await provider.exists('complaints/101/image.png');
+    expect(exists).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns false for exists when file is not found (404 or empty list)', async () => {
+    // 404 response
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+    });
+    expect(await provider.exists('nonexistent.png')).toBe(false);
+
+    // Empty list response
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+    });
+    expect(await provider.exists('nonexistent.png')).toBe(false);
+  });
+
+  it('propagates authentication, permission, and server errors from exists()', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      text: async () => 'Unauthorized',
+    });
+
+    await expect(provider.exists('complaints/101/image.png')).rejects.toThrow(
+      /ImageKit API query failed with HTTP 401/
+    );
+
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      text: async () => 'Internal Server Error',
+    });
+
+    await expect(provider.exists('complaints/101/image.png')).rejects.toThrow(
+      /ImageKit API query failed with HTTP 500/
+    );
+  });
+
+  it('inspects metadata via getMetadata and returns size and mimeType', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [
+        {
+          fileId: 'file_1',
+          name: 'image.png',
+          filePath: '/complaints/101/image.png',
+          size: 8192,
+          mime: 'image/png',
+        },
+      ],
+    });
+
+    const meta = await provider.getMetadata!('complaints/101/image.png');
+    expect(meta).toEqual({ size: 8192, mimeType: 'image/png' });
+
+    // When file does not exist, returns null
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+    });
+
+    const nullMeta = await provider.getMetadata!('complaints/101/missing.png');
+    expect(nullMeta).toBeNull();
+  });
+
+  it('deletes object by finding fileId and calling DELETE endpoint', async () => {
+    // 1. List query returns file
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [
+        {
+          fileId: 'file_del_999',
+          name: 'old-image.png',
+          filePath: '/complaints/101/old-image.png',
+        },
+      ],
+    });
+    // 2. Delete request succeeds
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+    });
+
+    await provider.delete('complaints/101/old-image.png');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    const [deleteUrl, deleteOptions] = mockFetch.mock.calls[1];
+    expect(deleteUrl).toBe('https://api.imagekit.io/v1/files/file_del_999');
+    expect(deleteOptions.method).toBe('DELETE');
+  });
+
+  it('resolves silently on delete when file does not exist', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+    });
+
+    await expect(provider.delete('complaints/101/nonexistent.png')).resolves.toBeUndefined();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('copies object using /v1/files/copy', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+    });
+
+    await provider.copy!(
+      'staging/complaints/101/file.png',
+      'complaints/101/file.png'
+    );
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    const [copyUrl, copyOptions] = mockFetch.mock.calls[0];
+    expect(copyUrl).toBe('https://api.imagekit.io/v1/files/copy');
+    expect(copyOptions.method).toBe('POST');
+    expect(JSON.parse(copyOptions.body)).toEqual({
+      sourceFilePath: '/staging/complaints/101/file.png',
+      destinationPath: '/complaints/101/',
+      includeFileVersions: false,
+    });
+  });
+
+  it('generates signed serve URL with HMAC-SHA1 signature and ik-t timestamp', async () => {
+    const key = 'complaints/101/private-evidence.png';
+    const serveUrl = await provider.getServeUrl(key, 600);
+    expect(typeof serveUrl).toBe('string');
+    expect(serveUrl).toContain('https://ik.imagekit.io/test-endpoint/complaints/101/private-evidence.png');
+    expect(serveUrl).toContain('ik-t=');
+    expect(serveUrl).toContain('ik-s=');
+  });
+
+  it('generates presigned upload URL for direct browser uploads', async () => {
+    const key = 'staging/complaints/101/direct-upload.jpg';
+    const uploadUrl = await provider.getPresignedUploadUrl!(key, 'image/jpeg', 2048, 600);
+    expect(typeof uploadUrl).toBe('string');
+    expect(uploadUrl).toContain('https://upload.imagekit.io/api/v1/files/upload');
+    expect(uploadUrl).toContain('token=');
+    expect(uploadUrl).toContain('expire=');
+    expect(uploadUrl).toContain('signature=');
+    expect(uploadUrl).toContain('publicKey=test-public-key');
+    expect(uploadUrl).toContain('fileName=direct-upload.jpg');
+    expect(uploadUrl).toContain('folder=%2Fstaging%2Fcomplaints%2F101');
+  });
+});
+
 describe('Provider Selection Registry', () => {
   const originalEnv = process.env;
 
@@ -339,5 +623,24 @@ describe('Provider Selection Registry', () => {
 
     const provider = getStorageProvider();
     expect(provider).toBeInstanceOf(S3StorageProvider);
+  });
+
+  it('throws helpful configuration error if MEDIA_STORAGE_PROVIDER=imagekit but env vars are missing', () => {
+    process.env.MEDIA_STORAGE_PROVIDER = 'imagekit';
+    delete process.env.IMAGEKIT_PUBLIC_KEY;
+    delete process.env.IMAGEKIT_PRIVATE_KEY;
+    delete process.env.IMAGEKIT_URL_ENDPOINT;
+
+    expect(() => getStorageProvider()).toThrow(/ImageKit storage credentials not configured/);
+  });
+
+  it('instantiates ImageKitStorageProvider when MEDIA_STORAGE_PROVIDER=imagekit and credentials are present', () => {
+    process.env.MEDIA_STORAGE_PROVIDER = 'imagekit';
+    process.env.IMAGEKIT_PUBLIC_KEY = 'test-pub-key';
+    process.env.IMAGEKIT_PRIVATE_KEY = 'test-priv-key';
+    process.env.IMAGEKIT_URL_ENDPOINT = 'https://ik.imagekit.io/test-id';
+
+    const provider = getStorageProvider();
+    expect(provider).toBeInstanceOf(ImageKitStorageProvider);
   });
 });
