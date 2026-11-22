@@ -3,6 +3,7 @@
 // Service to log and query ingestion run history in the ingestion_log table.
 
 import { pool } from '../../config/db';
+import logger from '../../utils/logger';
 
 export interface IngestionLogEntry {
   sourceType: string;
@@ -28,7 +29,7 @@ export interface IngestionLogRow {
 
 export const logIngestionRun = async (entry: IngestionLogEntry): Promise<number | null> => {
   if (!pool) {
-    console.warn('[INGEST_LOG] Database pool unavailable. Skipping log entry.');
+    logger.warn('[INGEST_LOG] Database pool unavailable. Skipping log entry.');
     return null;
   }
 
@@ -50,7 +51,7 @@ export const logIngestionRun = async (entry: IngestionLogEntry): Promise<number 
 
     return res.rows[0]?.id ?? null;
   } catch (err: any) {
-    console.error('[INGEST_LOG] Failed to write ingestion_log row:', err.message);
+    logger.error('[INGEST_LOG] Failed to write ingestion_log row:', err.message);
     return null;
   }
 };

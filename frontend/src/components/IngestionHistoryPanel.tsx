@@ -3,6 +3,11 @@
 import React, { useState, useEffect } from 'react';
 import { apiClient, IngestionLogItem } from '../lib/api';
 import { RefreshCw, AlertTriangle, CheckCircle2, Clock, Rss, Share2 } from 'lucide-react';
+import { Card, CardHeader, CardTitle, CardContent } from './ui/card';
+import { Badge } from './ui/badge';
+import { Button } from './ui/button';
+import { Skeleton } from './ui/skeleton';
+import { cn } from '../lib/utils';
 
 export const IngestionHistoryPanel: React.FC = () => {
   const [logs, setLogs] = useState<IngestionLogItem[]>([]);
@@ -66,51 +71,59 @@ export const IngestionHistoryPanel: React.FC = () => {
     return source;
   };
 
+  const statusBadge = (status: string) => {
+    if (status === 'failed') return <Badge variant="destructive"><AlertTriangle className="w-3 h-3 mr-1" /> Failed</Badge>;
+    if (status === 'partial') return <Badge variant="warning"><AlertTriangle className="w-3 h-3 mr-1" /> Partial</Badge>;
+    return <Badge variant="success"><CheckCircle2 className="w-3 h-3 mr-1" /> Success</Badge>;
+  };
+
   return (
-    <div className="cm-card p-5">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
+    <Card>
+      <CardHeader className="flex-row items-center justify-between space-y-0">
+        <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-neutral-300">
           <Clock className="w-4 h-4 text-indigo-400" />
-          <span className="text-xs font-bold text-neutral-300 uppercase tracking-wider">
-            Ingestion History (Last 7 Runs)
-          </span>
-        </div>
-        <button
-          onClick={fetchLogs}
-          disabled={loading}
-          className="p-1.5 hover:bg-white/5 rounded-lg transition-colors text-neutral-400 hover:text-white disabled:opacity-50 cursor-pointer"
-          title="Refresh logs"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-        </button>
-      </div>
-
-      {loading ? (
-        <div className="py-8 text-center text-xs text-neutral-500">Loading audit history...</div>
-      ) : error ? (
-        <div className="py-4 px-3 bg-neutral-900/50 border border-neutral-800 rounded-xl text-center text-xs text-neutral-500">
-          {error}
-        </div>
-      ) : logs.length === 0 ? (
-        <div className="py-8 text-center text-xs text-neutral-500">No ingestion logs recorded yet.</div>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-white/5 text-[10px] text-neutral-500 font-bold uppercase tracking-wider">
-                <th className="pb-2 pl-1">Date & Time</th>
-                <th className="pb-2">Source</th>
-                <th className="pb-2 text-right">Proc / Created / Dup</th>
-                <th className="pb-2 text-right">Status</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/[0.03] text-[11px]">
-              {logs.map((log) => {
-                const isSuccess = log.status === 'success';
-                const isPartial = log.status === 'partial';
-                const isFailed = log.status === 'failed' || (!isSuccess && !isPartial);
-
-                return (
+          Ingestion History (Last 7 Runs)
+        </CardTitle>
+        <Button variant="ghost" size="icon" onClick={fetchLogs} disabled={loading}>
+          <RefreshCw className={cn('w-3.5 h-3.5', loading && 'animate-spin')} />
+        </Button>
+      </CardHeader>
+      <CardContent>
+        {loading ? (
+          <div className="space-y-3">
+            {[1, 2, 3].map((i) => (
+              <div key={i} className="flex items-center gap-4">
+                <Skeleton className="h-4 w-24" />
+                <Skeleton className="h-4 w-20" />
+                <Skeleton className="h-4 w-16 ml-auto" />
+              </div>
+            ))}
+          </div>
+        ) : error ? (
+          <Card className="p-3 bg-red-500/10 border border-red-500/20">
+            <div className="flex items-center gap-2 text-xs text-red-400">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>{error}</span>
+            </div>
+          </Card>
+        ) : logs.length === 0 ? (
+          <Card className="p-8 text-center">
+            <Clock className="w-8 h-8 text-neutral-700 mx-auto mb-2" />
+            <p className="text-xs text-neutral-500">No ingestion logs recorded yet.</p>
+          </Card>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-white/5 text-[10px] text-neutral-500 font-bold uppercase tracking-wider">
+                  <th className="pb-2 pl-1">Date & Time</th>
+                  <th className="pb-2">Source</th>
+                  <th className="pb-2 text-right">Proc / Created / Dup</th>
+                  <th className="pb-2 text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.03] text-[11px]">
+                {logs.map((log) => (
                   <tr key={log.id} className="hover:bg-white/[0.01] transition-colors">
                     <td className="py-2.5 pl-1 text-neutral-400 font-mono text-[10px]">
                       {new Date(log.run_at).toLocaleString(undefined, {
@@ -128,41 +141,24 @@ export const IngestionHistoryPanel: React.FC = () => {
                     </td>
                     <td className="py-2.5 text-right font-mono text-neutral-400 text-[10px]">
                       <span className="text-neutral-200">{log.processed}</span> /{' '}
-                      <span className="text-emerald-400 font-semibold">{log.created}</span> /{' '}
+                      <span className="text-green-400 font-semibold">{log.created}</span> /{' '}
                       <span className="text-amber-400">{log.duplicates}</span>
                     </td>
                     <td className="py-2.5 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        {isFailed ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[9px] font-bold uppercase tracking-wider bg-rose-500/10 text-rose-400 border border-rose-500/20">
-                            <AlertTriangle className="w-3 h-3 shrink-0" />
-                            Failed
-                          </span>
-                        ) : isPartial ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[9px] font-bold uppercase tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                            <AlertTriangle className="w-3 h-3 shrink-0" />
-                            Partial
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[9px] font-bold uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                            <CheckCircle2 className="w-3 h-3 shrink-0" />
-                            Success
-                          </span>
-                        )}
-                      </div>
+                      {statusBadge(log.status)}
                       {log.failed_feeds && log.failed_feeds.length > 0 && (
-                        <div className="text-[9px] text-rose-400/80 font-mono mt-0.5">
+                        <div className="text-[9px] text-red-400/80 font-mono mt-0.5">
                           {log.failed_feeds.length} feed(s) failed
                         </div>
                       )}
                     </td>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 };

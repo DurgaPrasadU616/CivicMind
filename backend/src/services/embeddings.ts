@@ -1,6 +1,7 @@
 // backend/src/services/embeddings.ts
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import logger from '../utils/logger';
 
 // Local deterministic unit vector generator for offline/sandboxed environments
 const generateDeterministicEmbedding = (text: string): number[] => {
@@ -56,7 +57,7 @@ export const getEmbedding = async (text: string): Promise<number[]> => {
     }
     throw new Error('Malformed embedding response from Gemini API');
   } catch (error) {
-    console.warn('⚠️ Gemini Embeddings API failed, reverting to local fallback:');
+    logger.warn('⚠️ Gemini Embeddings API failed, reverting to local fallback:');
     return generateDeterministicEmbedding(text);
   }
 };

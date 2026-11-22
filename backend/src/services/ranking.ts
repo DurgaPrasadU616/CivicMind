@@ -10,6 +10,7 @@
 
 import { pool } from '../config/db';
 import { scoringConfig } from '../config/scoring';
+import logger from '../utils/logger';
 
 // ---------------------------------------------------------------------------
 // Pure functions — exported for unit testing
@@ -40,7 +41,7 @@ export const computeUrgencyDecay = (daysSinceFirstReport: number | null | undefi
 export const getResourceCostFactor = (category: string): number => {
   const factor = scoringConfig.RESOURCE_COST_WEIGHTS[category];
   if (factor === undefined) {
-    console.warn(
+    logger.warn(
       `[RANKING] No resource_cost_factor for category "${category}". Using neutral 1.0 fallback.`
     );
     return 1.0;
@@ -111,7 +112,7 @@ export const updateClusterPriorityScore = async (
     [priorityScore, clusterId]
   );
 
-  console.log(
+  logger.info(
     `[RANKING] Cluster ${clusterId} (${category}): ` +
     `severity=${severityScore}, decay=${computeUrgencyDecay(daysSince).toFixed(3)}, ` +
     `costFactor=${getResourceCostFactor(category).toFixed(2)}, priority=${priorityScore}`

@@ -4,15 +4,17 @@
 // and inspecting ingestion run logs.
 
 import { Router } from 'express';
-import { authenticateToken, requireRole } from '../middleware/auth';
+import { authenticateToken } from '../middleware/auth';
+import { requirePermission } from '../middleware/rbac';
 import { ingestNewsFeeds } from '../services/ingestion/newsIngestion';
 import { ingestSocialMediaPosts } from '../services/ingestion/socialIngestion';
 import { getIngestionLogs } from '../services/ingestion/ingestionLogService';
+import logger from '../utils/logger';
 
 const router = Router();
 
 // POST /api/ingest/news — Trigger news RSS ingestion (admin, govt, ngo, service_account)
-router.post('/ingest/news', authenticateToken, requireRole('admin', 'govt', 'ngo', 'service_account'), async (_req, res) => {
+router.post('/ingest/news', authenticateToken, requirePermission('write:complaints'), async (_req, res) => {
   try {
     const result = await ingestNewsFeeds();
     const statusCode = result.status === 'failed' ? 500 : 200;
@@ -22,7 +24,7 @@ router.post('/ingest/news', authenticateToken, requireRole('admin', 'govt', 'ngo
       data: result,
     });
   } catch (error: any) {
-    console.error('[INGEST] News ingestion route error:', error);
+    logger.error('[INGEST] News ingestion route error:', error);
     return res.status(500).json({
       status: 'failed',
       error: 'News ingestion failed',
@@ -32,7 +34,7 @@ router.post('/ingest/news', authenticateToken, requireRole('admin', 'govt', 'ngo
 });
 
 // POST /api/ingest/social — Trigger simulated social media ingestion (admin, govt, ngo, service_account)
-router.post('/ingest/social', authenticateToken, requireRole('admin', 'govt', 'ngo', 'service_account'), async (_req, res) => {
+router.post('/ingest/social', authenticateToken, requirePermission('write:complaints'), async (_req, res) => {
   try {
     const result = await ingestSocialMediaPosts();
     const statusCode = result.status === 'failed' ? 500 : 200;
@@ -42,7 +44,7 @@ router.post('/ingest/social', authenticateToken, requireRole('admin', 'govt', 'n
       data: result,
     });
   } catch (error: any) {
-    console.error('[INGEST] Social ingestion route error:', error);
+    logger.error('[INGEST] Social ingestion route error:', error);
     return res.status(500).json({
       status: 'failed',
       error: 'Social media ingestion failed',
@@ -68,7 +70,7 @@ const handleGetIngestionLog = async (req: any, res: any) => {
       totalPages: Math.ceil(total / limit),
     });
   } catch (error: any) {
-    console.error('[INGEST] Get ingestion log error:', error);
+    logger.error('[INGEST] Get ingestion log error:', error);
     return res.status(500).json({
       error: 'Failed to retrieve ingestion logs',
       details: error.message,
@@ -76,7 +78,7 @@ const handleGetIngestionLog = async (req: any, res: any) => {
   }
 };
 
-router.get('/ingestion/log', authenticateToken, requireRole('admin', 'govt'), handleGetIngestionLog);
-router.get('/ingest/log', authenticateToken, requireRole('admin', 'govt'), handleGetIngestionLog);
+router.get('/ingestion/log', authenticateToken, requirePermission('read:audit_logs'), handleGetIngestionLog);
+router.get('/ingest/log', authenticateToken, requirePermission('read:audit_logs'), handleGetIngestionLog);
 
 export default router;

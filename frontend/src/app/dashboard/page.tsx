@@ -2,16 +2,34 @@
 
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { apiClient } from '../../lib/api';
+import { apiClient, type ClusterStatus, type ActionLogEntry } from '../../lib/api';
 import {
-  TrendingUp, CheckCircle2, AlertOctagon, Landmark,
+  TrendingUp, CheckCircle2, AlertOctagon, Clock,
   Map, List, Search, ArrowUpDown,
   RefreshCw, AlertTriangle, Loader2, Bot, Zap, ChevronRight,
-  X, Activity
+  X, Activity, ArrowRight, History, MessageSquare, ShieldAlert,
+  FileText, BarChart3, Filter
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
 import { IngestionHistoryPanel } from '../../components/IngestionHistoryPanel';
+import { IssueCard, type IssueCardCluster } from '../../components/IssueCard';
+import {
+  getSeverityConfig, getMapDotFill,
+  getStatusConfig, getStatusDisplay, getTransitionLabel, getTransitionColor,
+  getSourceLabel
+} from '../../lib/dashboard-utils';
+
+import { Card, CardContent } from '../../components/ui/card';
+import { Badge } from '../../components/ui/badge';
+import { Button } from '../../components/ui/button';
+import { Input } from '../../components/ui/input';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '../../components/ui/tabs';
+import { Skeleton } from '../../components/ui/skeleton';
+import { Separator } from '../../components/ui/separator';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../../components/ui/select';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible';
+import { cn } from '../../lib/utils';
 
 interface ComplaintItem {
   id: string | number;
@@ -32,7 +50,12 @@ interface ClusterItem {
   complaintCount: number;
   severity: number;
   priorityScore?: number;
-  status: string;
+  hybridScore?: number;
+  geoCentroidLat?: number;
+  geoCentroidLng?: number;
+  temporalWeight?: number;
+  status: ClusterStatus;
+  needsReview?: boolean;
   recommendedAction?: string;
   actionSource?: string;
   lastUpdated?: string;
@@ -43,13 +66,51 @@ interface ClusterItem {
     generatedBy?: string;
     text?: string;
     generatedAt?: string | number | Date;
+    retrievedContext?: {
+      coldStart?: boolean;
+      pastCases?: Array<{ category?: string; title?: string; action_text?: string }>;
+      guidelines?: Array<{ source?: string; title?: string; content?: string }>;
+    } | null;
+    confidenceScore?: number;
   } | null;
   [key: string]: unknown;
 }
 
+/** Shape of a JSON-encoded recommended action (falls back to raw text). */
+interface RecommendationJson {
+  executive_summary?: string;
+  root_cause_analysis?: string;
+  budget_estimate?: string;
+  short_term_actions?: string[];
+  long_term_actions?: string[];
+}
+
+/**
+ * Reads the AI confidence score off a cluster. Kept as a helper so JSX ternary
+ * narrowing on `latestAction` cannot collapse the type to `never` here.
+ */
+const confidenceOf = (
+  cluster: { latestAction?: { confidenceScore?: number } | null } | null | undefined
+): number | undefined => cluster?.latestAction?.confidenceScore;
+
+const severityVariant = (score: number) => {
+  if (score >= 75) return 'destructive' as const;
+  if (score >= 40) return 'warning' as const;
+  return 'success' as const;
+};
+
+const statusVariant = (status: string) => {
+  switch (status) {
+    case 'open': return 'warning' as const;
+    case 'in_progress': return 'info' as const;
+    case 'resolved': return 'success' as const;
+    case 'escalated': return 'destructive' as const;
+    default: return 'secondary' as const;
+  }
+};
+
 export default function DashboardPage() {
   const { userRole, user } = useAuth();
-
 
   const [viewMode, setViewMode] = useState<'table' | 'map'>('table');
   const [searchQuery, setSearchQuery] = useState('');
@@ -59,11 +120,21 @@ export default function DashboardPage() {
   const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<'priority' | 'severity' | 'count'>('priority');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+  const [sidebarSection, setSidebarSection] = useState<'default' | 'detail'>('default');
 
   const [clusters, setClusters] = useState<ClusterItem[]>([]);
-  const [globalStats, setGlobalStats] = useState({ totalOpen: 0, totalResolved: 0, avgSeverity: 0, topRegion: 'N/A' });
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+
+  const [detailTab, setDetailTab] = useState<'overview' | 'history'>('overview');
+  const [clusterHistory, setClusterHistory] = useState<ActionLogEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [noteInput, setNoteInput] = useState('');
+  const [showNoteInput, setShowNoteInput] = useState<ClusterStatus | null>(null);
+  const [filterToolsOpen, setFilterToolsOpen] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(false);
 
   const MAP_BOUNDS = { minLat: 12.9400, maxLat: 12.9900, minLng: 77.5600, maxLng: 77.6400 };
   const getCoordinates = (lat: number, lng: number) => {
@@ -72,64 +143,117 @@ export default function DashboardPage() {
     return { x, y };
   };
 
-  const loadGlobalStats = useCallback(async () => {
-    try {
-      const res = await apiClient.getClusters();
-      const allCls = res.data as ClusterItem[];
-      let openCount = 0, resolvedCount = 0, severitySum = 0, activeClCount = 0;
-      const regionCounts: Record<string, number> = {};
-      allCls.forEach((c) => {
-        if (c.status !== 'resolved') { openCount += c.complaintCount; severitySum += c.severity; activeClCount++; }
-        resolvedCount += (c.complaints || []).filter((comp) => comp.status === 'resolved').length;
-        regionCounts[c.region] = (regionCounts[c.region] || 0) + c.complaintCount;
-      });
-      const avgSeverity = activeClCount > 0 ? Math.round(severitySum / activeClCount) : 0;
-      let topRegion = 'N/A', maxCount = 0;
-      Object.entries(regionCounts).forEach(([region, count]) => { if (count > maxCount) { maxCount = count; topRegion = region; } });
-      setGlobalStats({ totalOpen: openCount, totalResolved: resolvedCount, avgSeverity, topRegion });
-    } catch (err) { console.error('Failed to load global stats:', err); }
-  }, []);
-
-  const fetchFilteredClusters = useCallback(async () => {
+  const fetchFilteredClusters = useCallback(async (isLoadMore = false, targetPage = 0) => {
     setIsLoading(true);
     setErrorMsg('');
     try {
-      const res = await apiClient.getClusters({ category: filterCategory, region: filterRegion, status: filterStatus, search: searchQuery });
+      const currentOffset = isLoadMore ? targetPage * 50 : 0;
+      const res = await apiClient.getClusters({ 
+        category: filterCategory, 
+        region: filterRegion, 
+        status: filterStatus, 
+        search: searchQuery,
+        limit: 50,
+        offset: currentOffset
+      });
       const cls = res.data as ClusterItem[];
-      setClusters(cls);
-      if (cls.length > 0) {
-        const stillExists = cls.some((c) => String(c.id) === String(selectedClusterId));
-        if (!stillExists) setSelectedClusterId(String(cls[0].id));
+      
+      if (isLoadMore) {
+        setClusters((prev) => {
+          // Avoid duplicates if same page was called twice
+          const newIds = new Set(cls.map(c => c.id));
+          return [...prev.filter(c => !newIds.has(c.id)), ...cls];
+        });
       } else {
-        setSelectedClusterId(null);
+        setClusters(cls);
+        setPage(0); // Reset page on new filter
+      }
+
+      if (res.meta) {
+        setHasMore(currentOffset + 50 < res.meta.total);
+      } else {
+        setHasMore(cls.length === 50);
+      }
+
+      if (!isLoadMore) {
+        if (cls.length > 0) {
+          const stillExists = cls.some((c) => String(c.id) === String(selectedClusterId));
+          if (!stillExists && sidebarSection === 'detail') {
+            setSelectedClusterId(null);
+            setSidebarSection('default');
+          }
+        } else {
+          setSelectedClusterId(null);
+          setSidebarSection('default');
+        }
       }
     } catch (err) {
       console.error(err);
-      setErrorMsg('Failed to sync clusters. Please verify connection to the Express backend.');
+      setErrorMsg('Failed to load issues. Please check your connection and try again.');
     } finally {
       setIsLoading(false);
     }
-  }, [filterCategory, filterRegion, filterStatus, searchQuery, selectedClusterId]);
+  }, [filterCategory, filterRegion, filterStatus, searchQuery, selectedClusterId, sidebarSection]); // removed 'page' from dependencies
 
-  useEffect(() => {
-    const t = setTimeout(() => { fetchFilteredClusters(); loadGlobalStats(); }, 300);
-    return () => clearTimeout(t);
-  }, [fetchFilteredClusters, loadGlobalStats]);
+  // Rest of functions...
+  const ALLOWED_TRANSITIONS: Record<ClusterStatus, ClusterStatus[]> = {
+    open:        ['in_progress'],
+    in_progress: ['resolved', 'escalated'],
+    escalated:   ['in_progress'],
+    resolved:    ['open'],
+  };
 
-  const handleUpdateStatus = async (newStatus: 'pending' | 'in_progress' | 'resolved') => {
+  const handlePatchStatus = async (targetStatus: ClusterStatus, note?: string) => {
     if (!selectedClusterId) return;
     try {
-      await apiClient.updateClusterStatus(selectedClusterId, newStatus);
-      setClusters(prev => prev.map(c => String(c.id) === String(selectedClusterId) ? { ...c, status: newStatus } : c));
-      loadGlobalStats();
+      const result = await apiClient.patchClusterStatus(selectedClusterId, targetStatus, note);
+      setClusters(prev => prev.map(c =>
+        String(c.id) === String(selectedClusterId)
+          ? { ...c, status: result.cluster.status, needsReview: result.cluster.needsReview }
+          : c
+      ));
+      setShowNoteInput(null);
+      setNoteInput('');
+      if (detailTab === 'history') {
+        loadHistory(selectedClusterId);
+      }
     } catch (err: unknown) {
-      if (err && typeof err === 'object' && 'status' in err && (err as { status?: number }).status === 403) setErrorMsg('Permission denied. Only NGO/Govt/Admin accounts can update cluster status.');
-      else if (err && typeof err === 'object' && 'status' in err && (err as { status?: number }).status !== 401) setErrorMsg(err instanceof Error ? err.message : 'Error updating cluster status.');
+      if (err && typeof err === 'object' && 'status' in err) {
+        const e = err as { status?: number; message?: string };
+        if (e.status === 400) setErrorMsg(e.message || 'Invalid status transition.');
+        else if (e.status === 403) setErrorMsg('Permission denied. Only NGO/Govt/Admin accounts can update issue status.');
+        else if (e.status !== 401) setErrorMsg(e.message || 'Error updating issue status.');
+      }
     }
   };
 
+  const loadHistory = useCallback(async (clusterId: string) => {
+    setHistoryLoading(true);
+    try {
+      const result = await apiClient.getClusterHistory(clusterId);
+      setClusterHistory(result.history);
+    } catch (err) {
+      console.error('Failed to load issue history:', err);
+      setClusterHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Only re-fetch (resetting page to 0) when filters change
+    const t = setTimeout(() => { fetchFilteredClusters(false); }, 300);
+    return () => clearTimeout(t);
+  }, [fetchFilteredClusters]);
+
+  useEffect(() => {
+    if (detailTab === 'history' && selectedClusterId) {
+      loadHistory(selectedClusterId);
+    }
+  }, [detailTab, selectedClusterId, loadHistory]);
+
   const handleSort = (field: 'priority' | 'severity' | 'count') => {
-    if (sortBy === field) setSortOrder(sortOrder === 'asc' ? 'desc' : 'desc');
+    if (sortBy === field) setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc');
     else { setSortBy(field); setSortOrder('desc'); }
   };
 
@@ -146,7 +270,6 @@ export default function DashboardPage() {
 
   const selectedCluster = useMemo(() => clusters.find((c) => String(c.id) === String(selectedClusterId)) || null, [clusters, selectedClusterId]);
 
-  // Chart data — group complaints by category
   const chartData = useMemo(() => {
     const catCounts: Record<string, number> = {};
     clusters.forEach(c => { catCounts[c.category] = (catCounts[c.category] || 0) + c.complaintCount; });
@@ -156,36 +279,63 @@ export default function DashboardPage() {
     }));
   }, [clusters]);
 
-  const chartColors = ['#6366f1', '#f59e0b', '#3b82f6', '#ef4444', '#10b981', '#8b5cf6'];
+  const chartColors = ['#6366f1', '#f59e0b', '#3b82f6', '#ef4444', '#22c55e', '#8b5cf6'];
 
-  const getSeverityBadge = (score: number) => {
-    if (score >= 75) return 'bg-rose-500/10 text-rose-400 border-rose-500/20';
-    if (score >= 40) return 'bg-amber-500/10 text-amber-400 border-amber-500/20';
-    return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
-  };
-  const getPriorityBadge = (score: number) => {
-    if (score >= 70) return 'bg-violet-500/10 text-violet-300 border-violet-500/20';
-    if (score >= 35) return 'bg-orange-500/10 text-orange-300 border-orange-500/20';
-    return 'bg-sky-500/10 text-sky-400 border-sky-500/20';
-  };
-  const getSourceBadge = (source: string) => {
-    switch (source) {
-      case 'citizen_portal': return 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20';
-      case 'news_rss': return 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20';
-      case 'social_media': return 'bg-pink-500/10 text-pink-400 border-pink-500/20';
-      default: return 'bg-neutral-500/10 text-neutral-400 border-neutral-500/20';
-    }
-  };
-  const getSourceLabel = (source: string) => {
-    switch (source) {
-      case 'citizen_portal': return 'Portal';
-      case 'news_rss': return 'News';
-      case 'social_media': return 'Social';
-      default: return source || 'Unknown';
-    }
-  };
+  const summaryStats = useMemo(() => {
+    let openIssues = 0;
+    let highSeverityCount = 0;
+    let newToday = 0;
+    const resolvedClusters: ClusterItem[] = [];
 
-  // Greeting based on time of day
+    clusters.forEach((c) => {
+      if (c.status !== 'resolved') {
+        openIssues += c.complaintCount;
+        if (c.severity >= 40) highSeverityCount += c.complaintCount;
+      } else {
+        resolvedClusters.push(c);
+      }
+      const now = new Date();
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      (c.complaints || []).forEach((comp) => {
+        if (new Date(comp.created_at) >= todayStart) {
+          newToday++;
+        }
+      });
+    });
+
+    let avgResolutionDisplay = '\u2014';
+    if (resolvedClusters.length > 0) {
+      let totalHours = 0;
+      let count = 0;
+      resolvedClusters.forEach((c) => {
+        const complaints = c.complaints || [];
+        if (complaints.length > 0 && c.lastUpdated) {
+          const firstDate = complaints.reduce((earliest, comp) => {
+            const d = new Date(comp.created_at).getTime();
+            return d < earliest ? d : earliest;
+          }, Infinity);
+          if (firstDate < Infinity) {
+            const resolvedDate = new Date(c.lastUpdated).getTime();
+            totalHours += (resolvedDate - firstDate) / 3600000;
+            count++;
+          }
+        }
+      });
+      if (count > 0) {
+        const avgHrs = Math.round(totalHours / count);
+        if (avgHrs < 24) {
+          avgResolutionDisplay = `${avgHrs} hr${avgHrs !== 1 ? 's' : ''}`;
+        } else {
+          avgResolutionDisplay = `${Math.round(avgHrs / 24)} day${Math.round(avgHrs / 24) !== 1 ? 's' : ''}`;
+        }
+      }
+    }
+
+    return { openIssues, highSeverityCount, newToday, avgResolutionDisplay };
+  }, [clusters]);
+
+  const criticalCount = clusters.filter(c => c.severity >= 75 && c.status !== 'resolved').length;
+
   const getGreeting = () => {
     const h = new Date().getHours();
     if (h < 12) return 'Good morning';
@@ -193,427 +343,828 @@ export default function DashboardPage() {
     return 'Good evening';
   };
 
-  const criticalCount = clusters.filter(c => c.severity >= 75 && c.status !== 'resolved').length;
+  const handleSelectIssue = (id: string) => {
+    if (String(selectedClusterId) === String(id)) {
+      setSelectedClusterId(null);
+      setSidebarSection('default');
+    } else {
+      setSelectedClusterId(id);
+      setSidebarSection('detail');
+      setDetailTab('overview');
+      setClusterHistory([]);
+      setShowNoteInput(null);
+      setNoteInput('');
+    }
+  };
+
+  const handleRetry = () => {
+    fetchFilteredClusters();
+  };
+
+  const isOfficial = userRole && userRole !== 'citizen';
+  const canViewIngestion = userRole === 'admin' || userRole === 'govt';
+
+  const statCards = [
+    { label: 'Open Issues', value: summaryStats.openIssues, icon: AlertOctagon, variant: 'destructive' as const },
+    { label: 'High Severity', value: summaryStats.highSeverityCount, icon: TrendingUp, variant: 'warning' as const },
+    { label: 'New Today', value: summaryStats.newToday, icon: FileText, variant: 'info' as const },
+    { label: 'Avg Resolution', value: summaryStats.avgResolutionDisplay, icon: Clock, variant: 'success' as const },
+  ];
 
   return (
-    <div className="p-6 lg:p-8 space-y-6 max-w-[1400px] mx-auto w-full">
-
-      {/* Hero Banner */}
-      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-indigo-600/20 via-blue-600/10 to-transparent border border-indigo-500/10 p-6 lg:p-8">
-        <div className="absolute top-0 right-0 w-64 h-64 bg-indigo-500/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/4" />
-        <div className="relative">
-          <h1 className="text-xl lg:text-2xl font-bold text-white">
-            {getGreeting()}, {user?.name?.split(' ')[0] || 'there'} 👋
-          </h1>
-          <p className="text-sm text-neutral-400 mt-1.5">
-            {globalStats.totalOpen > 0
-              ? <>You have <span className="text-white font-semibold">{globalStats.totalOpen} open issues</span> across {clusters.length} active clusters.</>
-              : 'No active clusters to review right now.'}
-            {criticalCount > 0 && (
-              <> <span className="text-rose-400 font-semibold">{criticalCount} critical</span> need attention.</>
-            )}
-          </p>
-          {criticalCount > 0 && (
-            <button
-              onClick={() => { setFilterStatus('all'); setFilterCategory('all'); setFilterRegion('all'); setSearchQuery(''); }}
-              className="mt-4 inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl transition-all cursor-pointer"
-            >
-              <AlertOctagon className="w-3.5 h-3.5" />
-              View Critical Issues
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
-          )}
+    <div className="p-4 sm:p-6 lg:p-8 space-y-5 max-w-[1440px] mx-auto w-full">
+      {isLoading && clusters.length === 0 ? (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[1, 2, 3, 4].map((i) => (
+            <Card key={i}>
+              <CardContent className="flex items-center gap-4 p-5">
+                <Skeleton className="w-11 h-11 rounded-lg shrink-0" />
+                <div className="flex-1 space-y-2">
+                  <Skeleton className="h-3 w-16" />
+                  <Skeleton className="h-7 w-20" />
+                </div>
+              </CardContent>
+            </Card>
+          ))}
         </div>
-      </div>
-
-      {/* Stat Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        {[
-          { label: 'Open Issues', value: globalStats.totalOpen, icon: TrendingUp, color: 'indigo' },
-          { label: 'Resolved', value: globalStats.totalResolved, icon: CheckCircle2, color: 'emerald' },
-          { label: 'Avg Severity', value: `${globalStats.avgSeverity}`, icon: AlertOctagon, color: 'rose', suffix: '/100' },
-          { label: 'Top Region', value: globalStats.topRegion, icon: Landmark, color: 'amber' },
-        ].map((stat, i) => {
-          const Icon = stat.icon;
-          return (
-            <div key={i} className="cm-card stat-card p-5 flex items-center gap-4">
-              <div className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${
-                stat.color === 'indigo' ? 'bg-indigo-500/10 text-indigo-400' :
-                stat.color === 'emerald' ? 'bg-emerald-500/10 text-emerald-400' :
-                stat.color === 'rose' ? 'bg-rose-500/10 text-rose-400' :
-                'bg-amber-500/10 text-amber-400'
-              }`}>
-                <Icon className="w-5 h-5" />
-              </div>
-              <div>
-                <span className="text-[11px] text-neutral-500 font-semibold uppercase tracking-wider block">{stat.label}</span>
-                <span className="text-2xl font-extrabold text-white">
-                  {stat.value}
-                  {stat.suffix && <span className="text-xs font-normal text-neutral-500">{stat.suffix}</span>}
-                </span>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Admin / Govt Ingestion Audit Panel */}
-      {(userRole === 'admin' || userRole === 'govt') && (
-        <IngestionHistoryPanel />
+      ) : (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+          {statCards.map((stat) => {
+            const Icon = stat.icon;
+            const variantColors: Record<string, string> = {
+              destructive: 'bg-red-500/10 text-red-400',
+              warning: 'bg-amber-500/10 text-amber-400',
+              info: 'bg-indigo-500/10 text-indigo-400',
+              success: 'bg-green-500/10 text-green-400',
+            };
+            return (
+              <Card key={stat.label}>
+                <CardContent className="flex items-center gap-3 sm:gap-4 p-4 sm:p-5">
+                  <div className={cn('w-10 h-10 sm:w-11 sm:h-11 rounded-lg flex items-center justify-center shrink-0', variantColors[stat.variant])}>
+                    <Icon className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="text-[10px] sm:text-[11px] text-neutral-500 font-semibold uppercase tracking-wider block">{stat.label}</span>
+                    <span className="text-xl sm:text-2xl font-extrabold text-white">{stat.value}</span>
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
       )}
 
-      {/* Chart + Filters Row */}
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Bar Chart */}
-        <div className="cm-card p-5">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-indigo-400" />
-              <span className="text-xs font-bold text-neutral-300 uppercase tracking-wider">Complaints by Category</span>
+      <Card>
+        <CardContent className="p-4 sm:p-5">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+              <h2 className="text-sm sm:text-base font-bold text-white">
+                {getGreeting()}, {user?.name?.split(' ')[0] || 'there'}
+              </h2>
+              <p className="text-xs text-neutral-500 mt-0.5">
+                {summaryStats.openIssues > 0
+                  ? <>{summaryStats.openIssues} open issue{summaryStats.openIssues !== 1 ? 's' : ''} across {clusters.length} active issue{clusters.length !== 1 ? 's' : ''}.</>
+                  : 'No active issues to review right now.'}
+                {criticalCount > 0 && <> <span className="text-red-400 font-semibold">{criticalCount} critical</span> need attention.</>}
+              </p>
             </div>
+            {criticalCount > 0 && (
+              <Button
+                onClick={() => { setFilterStatus('all'); setFilterCategory('all'); setFilterRegion('all'); setSearchQuery(''); }}
+                size="sm"
+              >
+                <AlertOctagon className="w-3.5 h-3.5" />
+                View Critical
+                <ChevronRight className="w-3.5 h-3.5" />
+              </Button>
+            )}
           </div>
-          {chartData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={180}>
-              <BarChart data={chartData} margin={{ top: 0, right: 0, bottom: 0, left: -20 }}>
-                <XAxis dataKey="name" tick={{ fontSize: 10, fill: '#737373' }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fontSize: 10, fill: '#737373' }} axisLine={false} tickLine={false} />
-                <Tooltip
-                  contentStyle={{ background: '#18181b', border: '1px solid #27272a', borderRadius: 10, fontSize: 12 }}
-                  cursor={{ fill: 'rgba(255,255,255,0.02)' }}
-                />
-                <Bar dataKey="count" radius={[6, 6, 0, 0]} maxBarSize={40}>
-                  {chartData.map((_, idx) => (
-                    <Cell key={idx} fill={chartColors[idx % chartColors.length]} fillOpacity={0.8} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="h-[180px] flex items-center justify-center text-neutral-600 text-xs">No data</div>
-          )}
-        </div>
-
-        {/* Filter Controls */}
-        <div className="lg:col-span-2 cm-card p-5">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative flex-1 min-w-[200px]">
-              <Search className="absolute left-3 top-2.5 w-4 h-4 text-neutral-500" />
-              <input
-                type="text"
-                placeholder="Search clusters..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-9 pr-3 py-2.5 bg-white/[0.03] border border-white/5 rounded-xl text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-indigo-500/30 focus:ring-1 focus:ring-indigo-500/10 transition-all"
-              />
-            </div>
-            <select value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} className="px-3 py-2.5 bg-white/[0.03] border border-white/5 rounded-xl text-xs text-neutral-300 focus:outline-none focus:border-indigo-500/30">
-              <option value="all">All Categories</option>
-              <option value="infrastructure">Infrastructure</option>
-              <option value="sanitation">Sanitation</option>
-              <option value="utility">Utility</option>
-              <option value="noise">Noise</option>
-              <option value="safety">Safety</option>
-              <option value="other">Other</option>
-            </select>
-            <select value={filterRegion} onChange={(e) => setFilterRegion(e.target.value)} className="px-3 py-2.5 bg-white/[0.03] border border-white/5 rounded-xl text-xs text-neutral-300 focus:outline-none focus:border-indigo-500/30">
-              <option value="all">All Regions</option>
-              <option value="Downtown">Downtown</option>
-              <option value="North">North</option>
-              <option value="South">South</option>
-              <option value="East">East</option>
-              <option value="West">West</option>
-            </select>
-            <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="px-3 py-2.5 bg-white/[0.03] border border-white/5 rounded-xl text-xs text-neutral-300 focus:outline-none focus:border-indigo-500/30">
-              <option value="all">All Status</option>
-              <option value="pending">Pending</option>
-              <option value="in_progress">In Progress</option>
-              <option value="resolved">Resolved</option>
-            </select>
-
-            <div className="flex bg-white/[0.03] p-1 rounded-xl border border-white/5 select-none">
-              <button onClick={() => setViewMode('table')} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all ${viewMode === 'table' ? 'bg-white/5 text-white' : 'text-neutral-500'}`}>
-                <List className="w-3.5 h-3.5" /> Table
-              </button>
-              <button onClick={() => setViewMode('map')} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all ${viewMode === 'map' ? 'bg-white/5 text-white' : 'text-neutral-500'}`}>
-                <Map className="w-3.5 h-3.5" /> Map
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
+        </CardContent>
+      </Card>
 
       {errorMsg && (
-        <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-xl text-sm text-rose-400 flex gap-2 items-center">
-          <AlertTriangle className="w-5 h-5 shrink-0" />
-          <span>{errorMsg}</span>
-          <button onClick={() => setErrorMsg('')} className="ml-auto"><X className="w-4 h-4" /></button>
+        <div className="p-3 sm:p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-xs sm:text-sm text-red-400 flex gap-2 items-center">
+          <AlertTriangle className="w-4 h-5 shrink-0" />
+          <span className="flex-1">{errorMsg}</span>
+          <Button variant="ghost" size="icon" onClick={() => setErrorMsg('')}>
+            <X className="w-4 h-4" />
+          </Button>
         </div>
       )}
 
-      {/* Main Content: Table/Map + Slide-in Panel */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
-        {/* Table / Map */}
-        <div className={`${selectedCluster ? 'xl:col-span-2' : 'xl:col-span-3'} cm-card overflow-hidden transition-all duration-200`}>
-          {isLoading ? (
-            <div className="flex items-center justify-center p-16 text-neutral-400">
-              <RefreshCw className="w-6 h-6 animate-spin text-indigo-400 mr-3" />
-              <span className="text-sm">Loading clusters...</span>
+      <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
+        <div className="flex-1 min-w-0 order-2 lg:order-1">
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-xs text-neutral-500 font-semibold">
+              {sortedClusters.length} issue{sortedClusters.length !== 1 ? 's' : ''}
+            </span>
+            <div className="flex items-center gap-1 bg-white/[0.02] p-0.5 rounded-lg border border-white/5">
+              {(['priority', 'severity', 'count'] as const).map((field) => (
+                <Button
+                  key={field}
+                  onClick={() => handleSort(field)}
+                  variant={sortBy === field ? 'secondary' : 'ghost'}
+                  size="sm"
+                  className={cn('text-[11px]', sortBy !== field && 'text-neutral-600')}
+                >
+                  {field === 'priority' ? 'Priority' : field === 'severity' ? 'Severity' : 'Reports'}
+                  {sortBy === field && <ArrowUpDown className="w-3 h-3" />}
+                </Button>
+              ))}
             </div>
-          ) : viewMode === 'table' ? (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead>
-                  <tr className="border-b border-white/5 text-neutral-500 font-semibold select-none">
-                    <th className="px-5 py-3.5">Cluster Topic</th>
-                    <th className="px-5 py-3.5">Category</th>
-                    <th className="px-5 py-3.5">Region</th>
-                    <th className="px-5 py-3.5 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort('priority')}>
-                      <div className="flex items-center gap-1"><span className={sortBy === 'priority' ? 'text-indigo-400' : ''}>Priority</span><ArrowUpDown className="w-3 h-3" /></div>
-                    </th>
-                    <th className="px-5 py-3.5 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort('severity')}>
-                      <div className="flex items-center gap-1"><span className={sortBy === 'severity' ? 'text-rose-400' : ''}>Severity</span><ArrowUpDown className="w-3 h-3" /></div>
-                    </th>
-                    <th className="px-5 py-3.5 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort('count')}>
-                      <div className="flex items-center gap-1"><span>Reports</span><ArrowUpDown className="w-3 h-3" /></div>
-                    </th>
-                    <th className="px-5 py-3.5">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedClusters.length > 0 ? sortedClusters.map((cluster) => (
-                    <tr
-                      key={cluster.id}
-                      onClick={() => setSelectedClusterId(String(cluster.id) === String(selectedClusterId) ? null : String(cluster.id))}
-                      className={`table-row border-b border-white/[0.03] cursor-pointer ${String(selectedClusterId) === String(cluster.id) ? 'bg-indigo-500/5' : ''}`}
-                    >
-                      <td className="px-5 py-4">
-                        <div className="font-semibold text-white text-[13px]">{cluster.title}</div>
-                        <div className="text-[10px] text-neutral-600 mt-0.5 font-mono">{cluster.id}</div>
-                      </td>
-                      <td className="px-5 py-4"><span className="capitalize text-neutral-300">{cluster.category}</span></td>
-                      <td className="px-5 py-4 text-neutral-400">{cluster.region}</td>
-                      <td className="px-5 py-4">
-                        <span className={`px-2.5 py-1 rounded-full border font-semibold text-[10px] ${getPriorityBadge(cluster.priorityScore ?? cluster.severity)}`}>
-                          {cluster.priorityScore ?? cluster.severity}
-                        </span>
-                      </td>
-                      <td className="px-5 py-4">
-                        <span className={`px-2.5 py-1 rounded-full border font-semibold text-[10px] ${getSeverityBadge(cluster.severity)}`}>
-                          {cluster.severity}
-                        </span>
-                      </td>
-                      <td className="px-5 py-4 text-neutral-300 font-bold">{cluster.complaintCount}</td>
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-1.5">
-                          <span className={`w-1.5 h-1.5 rounded-full ${cluster.status === 'resolved' ? 'bg-emerald-500' : cluster.status === 'in_progress' ? 'bg-indigo-400' : 'bg-amber-400'}`} />
-                          <span className="capitalize text-neutral-400 text-[11px]">{cluster.status.replace(/_/g, ' ')}</span>
-                        </div>
-                      </td>
-                    </tr>
-                  )) : (
-                    <tr><td colSpan={7} className="text-center p-12 text-neutral-500 text-sm">No clusters found matching filters.</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            /* MAP VIEW */
-            <div className="p-6 flex flex-col items-center gap-4">
-              <span className="text-[10px] uppercase font-bold text-neutral-500 tracking-wider">Metro City — GPS Projection</span>
-              <div className="relative w-full max-w-[500px] border border-white/5 rounded-2xl overflow-hidden bg-[#0a0a0e] p-3">
-                <svg viewBox="0 0 500 400" className="w-full h-auto">
-                  <g className="fill-[#111115] stroke-white/5 stroke-2">
-                    <polygon points="0,0 500,0 500,100 0,160" />
-                    <polygon points="0,160 200,200 150,400 0,400" />
-                    <polygon points="500,100 500,320 300,250 200,200" />
-                    <polygon points="150,400 300,250 500,320 500,400 150,400" />
-                    <polygon points="0,160 200,200 300,250 150,400 0,160" className="fill-indigo-950/20" />
-                  </g>
-                  <g className="fill-neutral-600 text-[10px] uppercase font-bold tracking-widest pointer-events-none select-none">
-                    <text x="220" y="45">North</text>
-                    <text x="40" y="270">West</text>
-                    <text x="410" y="220">East</text>
-                    <text x="320" y="360">South</text>
-                    <text x="130" y="220" className="fill-indigo-500/60 text-[11px]">Downtown</text>
-                  </g>
-                  {sortedClusters.map((cluster) => {
-                    const { x, y } = getCoordinates(Number(cluster.latitude || 12.9716), Number(cluster.longitude || 77.5946));
-                    const isSelected = String(selectedClusterId) === String(cluster.id);
-                    let color = 'fill-emerald-500';
-                    if (cluster.severity >= 75) color = 'fill-rose-500';
-                    else if (cluster.severity >= 40) color = 'fill-amber-500';
-                    return (
-                      <g key={cluster.id} onClick={() => setSelectedClusterId(String(cluster.id))} className="cursor-pointer group">
-                        {isSelected && <circle cx={x} cy={y} r="14" className="fill-none stroke-white/50 stroke-2 animate-pulse" />}
-                        <circle cx={x} cy={y} r="18" className="fill-white/0 group-hover:fill-white/5 transition-all" />
-                        <circle cx={x} cy={y} r="8" className={`${color} opacity-30 group-hover:opacity-50`} />
-                        <circle cx={x} cy={y} r="4.5" className={`${color} stroke-black stroke-2`} />
-                      </g>
-                    );
-                  })}
-                </svg>
-              </div>
-              <div className="flex gap-6 text-[10px] text-neutral-500">
-                <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-rose-500" /> High (75+)</div>
-                <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" /> Medium (40-74)</div>
-                <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /> Low (&lt;40)</div>
-              </div>
-            </div>
-          )}
-          <div className="px-5 py-3 bg-white/[0.01] border-t border-white/5 text-[10px] text-neutral-600 flex justify-between">
-            <span>{sortedClusters.length} clusters shown</span>
-            <span>PostgreSQL + pgvector</span>
           </div>
-        </div>
 
-        {/* Slide-in Detail Panel */}
-        {selectedCluster && (
-          <div className="slide-panel xl:col-span-1 cm-card p-6 xl:sticky xl:top-20 max-h-[calc(100vh-6rem)] overflow-y-auto">
-            {/* Close button + heading */}
-            <div className="flex items-start justify-between mb-5">
-              <div>
-                <div className="flex items-center gap-2 mb-1">
-                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono border ${getPriorityBadge(selectedCluster.priorityScore ?? selectedCluster.severity)}`}>
-                    PRI {selectedCluster.priorityScore ?? selectedCluster.severity}
-                  </span>
-                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono border ${getSeverityBadge(selectedCluster.severity)}`}>
-                    SEV {selectedCluster.severity}
-                  </span>
-                </div>
-                <h2 className="text-base font-bold text-white leading-tight mt-2">{selectedCluster.title}</h2>
-                <div className="flex items-center gap-2 mt-1.5 text-[11px] text-neutral-500">
-                  <span className="font-mono">{selectedCluster.id}</span>
-                  <span>·</span>
-                  <span className="capitalize">{selectedCluster.category}</span>
-                  <span>·</span>
-                  <span>{selectedCluster.region}</span>
-                </div>
-              </div>
-              <button onClick={() => setSelectedClusterId(null)} className="p-1.5 rounded-lg text-neutral-500 hover:text-white hover:bg-white/5 transition-all">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Score breakdown */}
-            <div className="flex gap-3 mb-5">
-              <div className="flex-1 text-center p-3 bg-white/[0.02] rounded-xl border border-white/5">
-                <div className={`text-lg font-extrabold ${(selectedCluster.priorityScore ?? selectedCluster.severity) >= 70 ? 'text-violet-300' : (selectedCluster.priorityScore ?? selectedCluster.severity) >= 35 ? 'text-orange-300' : 'text-sky-400'}`}>
-                  {selectedCluster.priorityScore ?? selectedCluster.severity}
-                </div>
-                <div className="text-[9px] text-neutral-500 uppercase tracking-wider mt-0.5">Priority</div>
-              </div>
-              <div className="flex-1 text-center p-3 bg-white/[0.02] rounded-xl border border-white/5">
-                <div className={`text-lg font-extrabold ${selectedCluster.severity >= 75 ? 'text-rose-400' : selectedCluster.severity >= 40 ? 'text-amber-400' : 'text-emerald-400'}`}>
-                  {selectedCluster.severity}
-                </div>
-                <div className="text-[9px] text-neutral-500 uppercase tracking-wider mt-0.5">Severity</div>
-              </div>
-            </div>
-
-            <div className="h-px bg-white/5 mb-5" />
-
-            {/* Linked Reports */}
-            <div className="mb-5">
-              <span className="text-[11px] uppercase font-bold text-neutral-500 tracking-wider block mb-3">
-                Reports ({selectedCluster.complaints.length})
-              </span>
-              <div className="max-h-40 overflow-y-auto space-y-2 pr-1">
-                {selectedCluster.complaints.map((c: ComplaintItem) => (
-                  <div key={c.id} className="p-3 bg-white/[0.02] border border-white/5 rounded-xl">
-                    <div className="flex items-center justify-between mb-1 text-[10px]">
-                      <span className="font-mono font-bold text-indigo-400">{c.id}</span>
-                      <span className="text-neutral-600">{new Date(c.created_at).toLocaleDateString()}</span>
+          {isLoading && clusters.length === 0 ? (
+            <div className="space-y-3">
+              {[1, 2, 3, 4].map((i) => (
+                <Card key={i}>
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex-1 space-y-3">
+                        <div className="flex gap-2">
+                          <Skeleton className="h-5 w-20 rounded-full" />
+                          <Skeleton className="h-5 w-24 rounded-full" />
+                        </div>
+                        <Skeleton className="h-4 w-3/4" />
+                        <Skeleton className="h-3 w-1/2" />
+                        <div className="flex gap-3">
+                          <Skeleton className="h-3 w-16" />
+                          <Skeleton className="h-3 w-12" />
+                          <Skeleton className="h-3 w-20" />
+                        </div>
+                      </div>
+                      <Skeleton className="w-5 h-5 rounded-full shrink-0" />
                     </div>
-                    <p className="text-[11px] text-neutral-300 leading-normal line-clamp-2">&quot;{c.text}&quot;</p>
-                    <div className="flex items-center justify-between mt-1.5 pt-1.5 border-t border-white/5 text-[9px] text-neutral-500">
-                      <span className="capitalize">{c.status}</span>
-                      {c.source_name && (
-                        <span className={`px-1.5 py-0.5 rounded-full border font-semibold ${getSourceBadge(c.source_name)}`}>
-                          {getSourceLabel(c.source_name)}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
+                  </CardContent>
+                </Card>
+              ))}
             </div>
-
-            <div className="h-px bg-white/5 mb-5" />
-
-            {/* AI Recommendation */}
-            <div className="mb-5">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-[11px] uppercase font-bold text-neutral-500 tracking-wider">AI Action Plan</span>
-                {!!selectedCluster.latestAction && (
-                  <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-bold uppercase tracking-wider border ${
-                    selectedCluster.latestAction.generatedBy === 'gemini'
-                      ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
-                      : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                  }`}>
-                    {selectedCluster.latestAction.generatedBy === 'gemini' ? 'Gemini AI' : 'Rules'}
-                  </span>
+          ) : errorMsg && clusters.length === 0 ? (
+            <Card>
+              <CardContent className="p-12 text-center">
+                <div className="w-14 h-14 rounded-full bg-rose-500/10 border border-rose-500/20 flex items-center justify-center mx-auto mb-4">
+                  <AlertTriangle className="w-7 h-7 text-rose-400" />
+                </div>
+                <h3 className="text-base font-bold text-neutral-300 mb-1">Something went wrong</h3>
+                <p className="text-sm text-neutral-500 max-w-sm mx-auto mb-5">{errorMsg}</p>
+                <Button onClick={handleRetry}>
+                  <RefreshCw className="w-4 h-4" />
+                  Try again
+                </Button>
+              </CardContent>
+            </Card>
+          ) : sortedClusters.length === 0 ? (
+            <Card>
+              <CardContent className="p-12 text-center">
+                <div className="w-14 h-14 rounded-full bg-white/[0.02] border border-white/5 flex items-center justify-center mx-auto mb-4">
+                  <CheckCircle2 className="w-7 h-7 text-neutral-600" />
+                </div>
+                <h3 className="text-base font-bold text-neutral-400 mb-1">No issues to show</h3>
+                <p className="text-sm text-neutral-600 max-w-xs mx-auto">
+                  {searchQuery || filterCategory !== 'all' || filterRegion !== 'all' || filterStatus !== 'all'
+                    ? 'No issues match the current filters. Try adjusting your search criteria.'
+                    : criticalCount === 0 && clusters.length === 0
+                      ? 'No high-severity issues right now. Everything looks clear.'
+                      : 'No issues match the current filters.'}
+                </p>
+                {(searchQuery || filterCategory !== 'all' || filterRegion !== 'all' || filterStatus !== 'all') && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="mt-5"
+                    onClick={() => { setSearchQuery(''); setFilterCategory('all'); setFilterRegion('all'); setFilterStatus('all'); }}
+                  >
+                    Clear all filters
+                  </Button>
                 )}
-              </div>
-              {selectedCluster.latestAction ? (
-                <div className="p-3.5 bg-indigo-500/5 border border-indigo-500/10 rounded-xl">
-                  <div className="flex items-start gap-2">
-                    {selectedCluster.latestAction.generatedBy === 'gemini' ? (
-                      <Bot className="w-3.5 h-3.5 text-indigo-400 mt-0.5 shrink-0" />
-                    ) : (
-                      <Zap className="w-3.5 h-3.5 text-amber-400 mt-0.5 shrink-0" />
-                    )}
-                    <p className="text-[11px] text-indigo-200/80 leading-relaxed italic flex-1">
-                      &quot;{selectedCluster.latestAction.text}&quot;
-                    </p>
-                  </div>
-                  <div className="text-[9px] text-neutral-600 font-mono mt-2 pt-2 border-t border-indigo-500/10">
-                    {new Date(selectedCluster.latestAction.generatedAt || Date.now()).toLocaleString()}
-                  </div>
-                </div>
-              ) : selectedCluster.recommendedAction ? (
-                <div className="p-3.5 bg-indigo-500/5 border border-indigo-500/10 rounded-xl">
-                  <p className="text-[11px] text-indigo-200/80 leading-relaxed italic">&quot;{selectedCluster.recommendedAction}&quot;</p>
-                </div>
-              ) : (
-                <div className="p-3.5 bg-white/[0.02] border border-white/5 rounded-xl flex items-center gap-3">
-                  <Loader2 className="w-4 h-4 text-indigo-400 animate-spin shrink-0" />
-                  <p className="text-[11px] text-neutral-400">Generating recommendation...</p>
+              </CardContent>
+            </Card>
+          ) : viewMode === 'table' ? (
+            <div className="space-y-2">
+              {sortedClusters.map((cluster) => (
+                <IssueCard
+                  key={cluster.id}
+                  cluster={cluster as IssueCardCluster}
+                  isSelected={String(selectedClusterId) === String(cluster.id)}
+                  onSelect={handleSelectIssue}
+                />
+              ))}
+              {hasMore && (
+                <div className="flex justify-center pt-4 pb-2">
+                  <Button 
+                    variant="outline" 
+                    size="sm" 
+                    onClick={() => {
+                      const nextPage = page + 1;
+                      setPage(nextPage);
+                      fetchFilteredClusters(true, nextPage);
+                    }}
+                    disabled={isLoading}
+                  >
+                    {isLoading ? 'Loading...' : 'Load More'}
+                  </Button>
                 </div>
               )}
             </div>
-
-            {/* Operations */}
-            {userRole && userRole !== 'citizen' && (
-              <div>
-                <span className="text-[11px] uppercase font-bold text-neutral-500 tracking-wider block mb-3">Actions</span>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    onClick={() => handleUpdateStatus('in_progress')}
-                    disabled={selectedCluster.status === 'in_progress'}
-                    className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-600/20 text-white font-semibold text-xs rounded-xl transition-all cursor-pointer disabled:cursor-not-allowed"
-                  >
-                    In Progress
-                  </button>
-                  <button
-                    onClick={() => handleUpdateStatus('resolved')}
-                    disabled={selectedCluster.status === 'resolved'}
-                    className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-600/20 text-white font-semibold text-xs rounded-xl transition-all cursor-pointer disabled:cursor-not-allowed"
-                  >
-                    Resolve
-                  </button>
+          ) : (
+            <Card>
+              <CardContent className="p-4 sm:p-6 flex flex-col items-center gap-4">
+                <span className="text-[10px] uppercase font-bold text-neutral-500 tracking-wider">Metro City \u2014 GPS Projection</span>
+                <div className="relative w-full max-w-[500px] border border-white/5 rounded-lg overflow-hidden bg-[#0a0a0e] p-3">
+                  <svg viewBox="0 0 500 400" className="w-full h-auto">
+                    <g className="fill-[#111115] stroke-white/5 stroke-2">
+                      <polygon points="0,0 500,0 500,100 0,160" />
+                      <polygon points="0,160 200,200 150,400 0,400" />
+                      <polygon points="500,100 500,320 300,250 200,200" />
+                      <polygon points="150,400 300,250 500,320 500,400 150,400" />
+                      <polygon points="0,160 200,200 300,250 150,400 0,160" className="fill-indigo-950/20" />
+                    </g>
+                    <g className="fill-neutral-600 text-[10px] uppercase font-bold tracking-widest pointer-events-none select-none">
+                      <text x="220" y="45">North</text>
+                      <text x="40" y="270">West</text>
+                      <text x="410" y="220">East</text>
+                      <text x="320" y="360">South</text>
+                      <text x="130" y="220" className="fill-indigo-500/60 text-[11px]">Downtown</text>
+                    </g>
+                    {sortedClusters.map((cluster) => {
+                      const { x, y } = getCoordinates(Number(cluster.latitude || 12.9716), Number(cluster.longitude || 77.5946));
+                      const isSelected = String(selectedClusterId) === String(cluster.id);
+                      const dotFill = getMapDotFill(cluster.severity);
+                      return (
+                        <g key={cluster.id} onClick={() => handleSelectIssue(String(cluster.id))} className="cursor-pointer group">
+                          {isSelected && <circle cx={x} cy={y} r="14" className="fill-none stroke-white/50 stroke-2 animate-pulse" />}
+                          <circle cx={x} cy={y} r="18" className="fill-white/0 group-hover:fill-white/5 transition-all" />
+                          <circle cx={x} cy={y} r="8" className={`${dotFill} opacity-30 group-hover:opacity-50`} />
+                          <circle cx={x} cy={y} r="4.5" className={`${dotFill} stroke-black stroke-2`} />
+                        </g>
+                      );
+                    })}
+                  </svg>
                 </div>
-                <div className="text-[9px] text-neutral-600 text-center mt-2">Cascades to all linked complaints</div>
+                <div className="flex gap-4 sm:gap-6 text-[10px] text-neutral-500 flex-wrap justify-center">
+                  <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-red-500" /> Critical (75+)</div>
+                  <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" /> Medium (40\u201374)</div>
+                  <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-green-500" /> Low (&lt;40)</div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+
+        <div className="w-full lg:w-80 xl:w-96 shrink-0 order-1 lg:order-2 space-y-4">
+          {sidebarSection === 'detail' && selectedCluster ? (
+            <div className="slide-in">
+              <Card>
+                <CardContent className="p-5 lg:sticky lg:top-20 max-h-[calc(100vh-8rem)] overflow-y-auto">
+                  <div className="flex items-start justify-between mb-4">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                        <Badge variant={severityVariant(selectedCluster.severity)}>
+                          {getSeverityConfig(selectedCluster.severity).icon} {getSeverityConfig(selectedCluster.severity).label}
+                        </Badge>
+                        {selectedCluster.needsReview && (
+                          <Badge variant="warning" className="animate-pulse">
+                            <ShieldAlert className="w-2.5 h-2.5" /> Needs Review
+                          </Badge>
+                        )}
+                      </div>
+                      <h2 className="text-sm font-bold text-white leading-tight mt-1.5">{selectedCluster.title}</h2>
+                      <div className="flex items-center gap-2 mt-1 text-[11px] text-neutral-500">
+                        <span className="capitalize">{selectedCluster.category}</span>
+                        <span>\u00B7</span>
+                        <span>{selectedCluster.region}</span>
+                        <span>\u00B7</span>
+                        <span>{selectedCluster.complaintCount} report{selectedCluster.complaintCount !== 1 ? 's' : ''}</span>
+                      </div>
+                    </div>
+                    <Button variant="ghost" size="icon" onClick={() => { setSelectedClusterId(null); setSidebarSection('default'); }} className="ml-2 shrink-0">
+                      <X className="w-4 h-4" />
+                    </Button>
+                  </div>
+
+                  <Tabs value={detailTab} onValueChange={(v) => setDetailTab(v as 'overview' | 'history')}>
+                    <TabsList className="w-full mb-4">
+                      <TabsTrigger value="overview" className="flex-1"><Activity className="w-3.5 h-3.5" /> Overview</TabsTrigger>
+                      <TabsTrigger value="history" className="flex-1"><History className="w-3.5 h-3.5" /> History</TabsTrigger>
+                    </TabsList>
+
+                    <TabsContent value="overview">
+                      <div className="flex gap-2 mb-4">
+                        <div className="flex-1 text-center p-3 bg-white/[0.02] rounded-lg border border-white/5">
+                          <div className={cn('text-lg font-extrabold', getSeverityConfig(selectedCluster.severity).textClass)}>
+                            {getSeverityConfig(selectedCluster.severity).icon}
+                          </div>
+                          <div className="text-[9px] text-neutral-500 uppercase tracking-wider mt-0.5">Severity</div>
+                        </div>
+                        <div className="flex-1 text-center p-3 bg-white/[0.02] rounded-lg border border-white/5">
+                          <div className={cn('text-lg font-extrabold', getSeverityConfig(selectedCluster.priorityScore ?? selectedCluster.severity).textClass)}>
+                            {getSeverityConfig(selectedCluster.priorityScore ?? selectedCluster.severity).icon}
+                          </div>
+                          <div className="text-[9px] text-neutral-500 uppercase tracking-wider mt-0.5">Priority</div>
+                        </div>
+                        <div className="flex-1 text-center p-3 bg-white/[0.02] rounded-lg border border-white/5">
+                          <div className="text-lg font-extrabold text-indigo-400">
+                            {selectedCluster.hybridScore != null ? Math.round(selectedCluster.hybridScore) : '—'}
+                          </div>
+                          <div className="text-[9px] text-neutral-500 uppercase tracking-wider mt-0.5">Hybrid</div>
+                        </div>
+                        <div className="flex-1 text-center p-3 bg-white/[0.02] rounded-lg border border-white/5">
+                          <div className={cn('text-[11px] font-bold capitalize mt-1', getStatusConfig(selectedCluster.status).textClass)}>
+                            {getStatusConfig(selectedCluster.status).label}
+                          </div>
+                          <div className="text-[9px] text-neutral-500 uppercase tracking-wider mt-0.5">Status</div>
+                        </div>
+                      </div>
+
+                      {(selectedCluster.geoCentroidLat != null || selectedCluster.latitude != null) && (
+                        <div className="text-[11px] text-neutral-400 flex items-center justify-between p-2.5 bg-white/[0.02] rounded-lg border border-white/5 mb-4">
+                          <span className="text-neutral-500 font-semibold uppercase text-[10px]">Centroid</span>
+                          <span className="font-mono text-neutral-300">
+                            {Number(selectedCluster.geoCentroidLat ?? selectedCluster.latitude).toFixed(4)}, {Number(selectedCluster.geoCentroidLng ?? selectedCluster.longitude).toFixed(4)}
+                          </span>
+                        </div>
+                      )}
+
+                      <Separator className="mb-4" />
+
+                      <div className="mb-4">
+                        <span className="text-[11px] uppercase font-bold text-neutral-500 tracking-wider block mb-2.5">
+                          Reports ({selectedCluster.complaints.length})
+                        </span>
+                        <div className="max-h-36 overflow-y-auto space-y-2 pr-1">
+                          {selectedCluster.complaints.map((c: ComplaintItem) => (
+                            <div key={c.id} className="p-3 bg-white/[0.02] border border-white/5 rounded-lg">
+                              <div className="flex items-center justify-between mb-1 text-[10px]">
+                                <span className="font-mono font-bold text-indigo-400">{c.id}</span>
+                                <span className="text-neutral-600">{new Date(c.created_at).toLocaleDateString()}</span>
+                              </div>
+                              <p className="text-[11px] text-neutral-300 leading-normal line-clamp-2">&ldquo;{c.text}&rdquo;</p>
+                              <div className="flex items-center justify-between mt-1.5 pt-1.5 border-t border-white/5 text-[9px] text-neutral-500">
+                                <span className="capitalize">{c.status}</span>
+                                {c.source_name && (
+                                  <Badge variant="outline" className="text-[9px] px-1.5 py-0.5">
+                                    {getSourceLabel(c.source_name)}
+                                  </Badge>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <Separator className="mb-4" />
+
+                      <div className="mb-4">
+                        <div className="flex items-center gap-2 mb-2.5">
+                          <span className="text-[11px] uppercase font-bold text-neutral-500 tracking-wider">AI Action Plan</span>
+                          {!!selectedCluster.latestAction && (
+                            <Badge variant={selectedCluster.latestAction.generatedBy === 'gemini' ? 'info' : 'warning'} className="text-[9px]">
+                              {selectedCluster.latestAction.generatedBy === 'gemini' ? 'Gemini AI' : 'Rules'}
+                            </Badge>
+                          )}
+                        </div>
+                        {selectedCluster.latestAction ? (
+                          <div className="p-3.5 bg-indigo-500/5 border border-indigo-500/10 rounded-lg">
+                            <div className="flex items-start gap-2">
+                              {selectedCluster.latestAction.generatedBy === 'gemini' ? (
+                                <Bot className="w-3.5 h-3.5 text-indigo-400 mt-0.5 shrink-0" />
+                              ) : (
+                                <Zap className="w-3.5 h-3.5 text-amber-400 mt-0.5 shrink-0" />
+                              )}
+                              <p className="text-[11px] text-indigo-200/80 leading-relaxed italic flex-1">
+                                &ldquo;{selectedCluster.latestAction.text}&rdquo;
+                              </p>
+                            </div>
+                            <div className="text-[9px] text-neutral-600 font-mono mt-2 pt-2 border-t border-indigo-500/10 flex justify-between items-center">
+                              <span>{selectedCluster.latestAction.generatedAt ? new Date(selectedCluster.latestAction.generatedAt).toLocaleString() : 'Just now'}</span>
+                            </div>
+                            
+                            {selectedCluster.latestAction.retrievedContext && (
+                              <div className="mt-3 pt-3 border-t border-indigo-500/10">
+                                <Collapsible open={showReasoning} onOpenChange={setShowReasoning}>
+                                <CollapsibleTrigger asChild>
+                                  <button className="text-[10px] uppercase font-bold text-indigo-400/80 tracking-wider cursor-pointer flex items-center gap-1.5 select-none hover:text-indigo-300 transition-colors">
+                                    <ChevronRight className={cn('w-3 h-3 transition-transform', showReasoning && 'rotate-90')} />
+                                    Why this recommendation?
+                                    {selectedCluster.latestAction.confidenceScore !== undefined && (
+                                      <Badge className={cn(
+                                        'ml-auto text-[8px] px-1.5 py-0.5',
+                                        selectedCluster.latestAction.confidenceScore >= 75 ? 'success' :
+                                        selectedCluster.latestAction.confidenceScore >= 50 ? 'warning' : 'destructive'
+                                      )}>
+                                        {selectedCluster.latestAction.confidenceScore >= 75 ? 'High Confidence' :
+                                         selectedCluster.latestAction.confidenceScore >= 50 ? 'Medium Confidence' : 'Low Confidence'}
+                                      </Badge>
+                                    )}
+                                  </button>
+                                </CollapsibleTrigger>
+                                <CollapsibleContent className="mt-2.5">
+                                  <div className="space-y-3 pl-4 border-l border-indigo-500/10">
+                                    {selectedCluster.latestAction.retrievedContext.coldStart && (
+                                      <p className="text-[10px] text-neutral-400 italic">No similar past cases yet — this is a novel issue type. Relying entirely on internal guidelines.</p>
+                                    )}
+                                    
+                                    {(selectedCluster.latestAction.retrievedContext.pastCases?.length ?? 0) > 0 && (
+                                      <div>
+                                        <h4 className="text-[9px] text-neutral-500 font-bold uppercase tracking-wider mb-1">Similar Past Cases</h4>
+                                        <ul className="space-y-1.5">
+                                          {selectedCluster.latestAction.retrievedContext.pastCases?.map((c, i) => (
+                                            <li key={i} className="text-[10px] text-neutral-300 leading-snug">
+                                              <span className="font-semibold text-indigo-300">[{c.category}] {c.title}</span><br />
+                                              <span className="text-neutral-500">Action: {c.action_text}</span>
+                                            </li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                    
+                                    {(selectedCluster.latestAction.retrievedContext.guidelines?.length ?? 0) > 0 && (
+                                      <div>
+                                        <h4 className="text-[9px] text-neutral-500 font-bold uppercase tracking-wider mb-1">Relevant Guidelines</h4>
+                                        <ul className="space-y-1.5">
+                                          {selectedCluster.latestAction.retrievedContext.guidelines?.map((g, i) => (
+                                            <li key={i} className="text-[10px] text-neutral-300 leading-snug">
+                                              <span className="font-semibold text-amber-400/80">[{g.source}] {g.title}</span><br />
+                                              <span className="text-neutral-400 italic">&quot;{g.content}&quot;</span>
+                                            </li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                  </div>
+                                </CollapsibleContent>
+                              </Collapsible>
+                              </div>
+                            )}
+                          </div>
+                        ) : selectedCluster.recommendedAction ? (
+                          <div className="space-y-3">
+                            {(() => {
+                              const raw = selectedCluster.recommendedAction || '';
+                              const confidenceScore = confidenceOf(selectedCluster);
+                              let parsed: RecommendationJson | null = null;
+                              try {
+                                parsed = JSON.parse(raw);
+                              } catch {
+                                // Not JSON
+                              }
+
+                              if (parsed && typeof parsed === 'object') {
+                                return (
+                                  <>
+                                    <div className="p-3.5 bg-indigo-500/5 border border-indigo-500/10 rounded-lg">
+                                      <p className="text-[11px] text-indigo-200/80 leading-relaxed italic mb-2">&ldquo;{parsed.executive_summary}&rdquo;</p>
+                                      
+                                      <div className="grid grid-cols-2 gap-3 mt-3">
+                                        {parsed.root_cause_analysis && (
+                                          <div>
+                                            <h4 className="text-[9px] text-indigo-400 font-bold uppercase tracking-wider mb-1">Root Cause</h4>
+                                            <p className="text-[10px] text-indigo-200/60 leading-tight">{parsed.root_cause_analysis}</p>
+                                          </div>
+                                        )}
+                                        {parsed.budget_estimate && (
+                                          <div>
+                                            <h4 className="text-[9px] text-indigo-400 font-bold uppercase tracking-wider mb-1">Est. Budget</h4>
+                                            <p className="text-[10px] text-indigo-200/60 leading-tight">{parsed.budget_estimate}</p>
+                                          </div>
+                                        )}
+                                        {parsed.short_term_actions && parsed.short_term_actions.length > 0 && (
+                                          <div>
+                                            <h4 className="text-[9px] text-indigo-400 font-bold uppercase tracking-wider mb-1">Short Term</h4>
+                                            <ul className="list-disc pl-3 space-y-1">
+                                              {parsed.short_term_actions.map((a: string, i: number) => (
+                                                <li key={i} className="text-[10px] text-indigo-200/60 leading-tight">{a}</li>
+                                              ))}
+                                            </ul>
+                                          </div>
+                                        )}
+                                        {parsed.long_term_actions && parsed.long_term_actions.length > 0 && (
+                                          <div>
+                                            <h4 className="text-[9px] text-indigo-400 font-bold uppercase tracking-wider mb-1">Long Term</h4>
+                                            <ul className="list-disc pl-3 space-y-1">
+                                              {parsed.long_term_actions.map((a: string, i: number) => (
+                                                <li key={i} className="text-[10px] text-indigo-200/60 leading-tight">{a}</li>
+                                              ))}
+                                            </ul>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                    {confidenceScore && (
+                                      <div className="flex items-center gap-1.5 justify-end">
+                                        <span className="text-[9px] uppercase font-bold text-neutral-500 tracking-wider">AI Confidence</span>
+                                        <Badge variant={confidenceScore > 70 ? 'success' : 'warning'} className="text-[9px] px-1 py-0 h-4">
+                                          {confidenceScore}%
+                                        </Badge>
+                                      </div>
+                                    )}
+                                  </>
+                                );
+                              }
+
+                              return (
+                                <div className="p-3.5 bg-indigo-500/5 border border-indigo-500/10 rounded-lg">
+                                  <p className="text-[11px] text-indigo-200/80 leading-relaxed italic">&ldquo;{raw}&rdquo;</p>
+                                  {confidenceScore && (
+                                    <div className="flex items-center gap-1.5 justify-end mt-2">
+                                      <span className="text-[9px] uppercase font-bold text-neutral-500 tracking-wider">AI Confidence</span>
+                                      <Badge variant={confidenceScore > 70 ? 'success' : 'warning'} className="text-[9px] px-1 py-0 h-4">
+                                        {confidenceScore}%
+                                      </Badge>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        ) : (
+                          <div className="p-3.5 bg-white/[0.02] border border-white/5 rounded-lg flex items-center gap-3">
+                            <Loader2 className="w-4 h-4 text-indigo-400 animate-spin shrink-0" />
+                            <p className="text-[11px] text-neutral-400">Generating recommendation...</p>
+                          </div>
+                        )}
+                      </div>
+
+                      {isOfficial ? (
+                        <div>
+                          <Separator className="mb-4" />
+                          <span className="text-[11px] uppercase font-bold text-neutral-500 tracking-wider block mb-3">Actions</span>
+                          {(() => {
+                            const currentStatus = selectedCluster.status as ClusterStatus;
+                            const legalNextStatuses = ALLOWED_TRANSITIONS[currentStatus] || [];
+                            if (legalNextStatuses.length === 0) return (
+                              <div className="p-3 bg-white/[0.02] border border-white/5 rounded-lg text-center text-neutral-600 text-[11px]">
+                                No transitions available from &ldquo;{getStatusDisplay(currentStatus)}&rdquo;.
+                              </div>
+                            );
+                            return (
+                              <div className="space-y-2">
+                                {legalNextStatuses.map((nextStatus) => (
+                                  <div key={nextStatus}>
+                                    {showNoteInput === nextStatus ? (
+                                      <div className="p-3 bg-white/[0.02] border border-white/5 rounded-lg space-y-2">
+                                        <div className="text-[10px] text-neutral-400 font-semibold flex items-center gap-1.5">
+                                          <ArrowRight className="w-3 h-3" />
+                                          Moving to <span className="text-white">{getTransitionLabel(nextStatus)}</span>
+                                        </div>
+                                        <textarea
+                                          value={noteInput}
+                                          onChange={(e) => setNoteInput(e.target.value)}
+                                          placeholder="Optional note (e.g. &quot;Dispatched repair crew&quot;)..."
+                                          rows={2}
+                                          className="w-full bg-white/[0.03] border border-white/5 rounded-lg text-xs text-neutral-200 placeholder-neutral-600 p-2 focus:outline-none focus:border-indigo-500/30 resize-none"
+                                        />
+                                        <div className="flex gap-2">
+                                          <Button
+                                            onClick={() => handlePatchStatus(nextStatus, noteInput || undefined)}
+                                            size="sm"
+                                            className={cn('flex-1', getTransitionColor(nextStatus).replace('bg-', 'bg-').replace('hover:bg-', 'hover:bg-'))}
+                                          >
+                                            Confirm
+                                          </Button>
+                                          <Button
+                                            variant="secondary"
+                                            size="sm"
+                                            onClick={() => { setShowNoteInput(null); setNoteInput(''); }}
+                                          >
+                                            Cancel
+                                          </Button>
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <Button
+                                        onClick={() => setShowNoteInput(nextStatus)}
+                                        size="sm"
+                                        className={cn('w-full justify-center text-xs', getTransitionColor(nextStatus))}
+                                      >
+                                        <MessageSquare className="w-3.5 h-3.5" />
+                                        {nextStatus === 'open' ? 'Reopen' : `Mark ${getTransitionLabel(nextStatus)}`}
+                                      </Button>
+                                    )}
+                                  </div>
+                                ))}
+                                <div className="text-[9px] text-neutral-600 text-center pt-1">Action is logged with your account</div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      ) : (
+                        <div>
+                          <Separator className="mb-4" />
+                          <div className="p-3 bg-white/[0.02] border border-white/5 rounded-lg text-center text-neutral-500 text-[11px]">
+                            {userRole === 'citizen' ? 'Citizen accounts are read-only. Use the History tab to view actions.' : 'Sign in with NGO/Govt/Admin to manage.'}
+                          </div>
+                        </div>
+                      )}
+                    </TabsContent>
+
+                    <TabsContent value="history">
+                      {historyLoading ? (
+                        <div className="flex items-center justify-center py-10 text-neutral-500">
+                          <Loader2 className="w-5 h-5 animate-spin mr-2 text-indigo-400" />
+                          <span className="text-xs">Loading audit trail...</span>
+                        </div>
+                      ) : clusterHistory.length === 0 ? (
+                        <div className="text-center py-10">
+                          <Clock className="w-8 h-8 text-neutral-700 mx-auto mb-3" />
+                          <p className="text-sm text-neutral-500">No status changes recorded yet.</p>
+                          <p className="text-xs text-neutral-600 mt-1">History appears here after the first official action.</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          <div className="text-[10px] text-neutral-600 uppercase tracking-wider font-bold mb-4 flex items-center gap-2">
+                            <History className="w-3.5 h-3.5" />
+                            {clusterHistory.length} event{clusterHistory.length !== 1 ? 's' : ''} \u2014 newest first
+                          </div>
+                          {clusterHistory.map((entry, idx) => (
+                            <div key={entry.id} className={cn('relative pl-6', idx < clusterHistory.length - 1 && 'pb-4')}>
+                              {idx < clusterHistory.length - 1 && (
+                                <div className="absolute left-2 top-4 bottom-0 w-px bg-white/5" />
+                              )}
+                              <div className={cn(
+                                'absolute left-0 top-1 w-4 h-4 rounded-full border-2 flex items-center justify-center',
+                                entry.newStatus === 'resolved' ? 'border-green-500 bg-green-500/20' :
+                                entry.newStatus === 'escalated' ? 'border-red-500 bg-red-500/20' :
+                                entry.newStatus === 'in_progress' ? 'border-indigo-500 bg-indigo-500/20' :
+                                'border-amber-500 bg-amber-500/20'
+                              )}>
+                                <div className={cn(
+                                  'w-1.5 h-1.5 rounded-full',
+                                  entry.newStatus === 'resolved' ? 'bg-green-400' :
+                                  entry.newStatus === 'escalated' ? 'bg-red-400' :
+                                  entry.newStatus === 'in_progress' ? 'bg-indigo-400' :
+                                  'bg-amber-400'
+                                )} />
+                              </div>
+                              <div className="bg-white/[0.02] border border-white/5 rounded-lg p-3">
+                                <div className="flex items-center gap-1.5 mb-2">
+                                  <Badge variant={statusVariant(entry.previousStatus)} className="text-[9px]">
+                                    {getStatusDisplay(entry.previousStatus)}
+                                  </Badge>
+                                  <ArrowRight className="w-3 h-3 text-neutral-600" />
+                                  <Badge variant={statusVariant(entry.newStatus)} className="text-[9px]">
+                                    {getStatusDisplay(entry.newStatus)}
+                                  </Badge>
+                                </div>
+                                <div className="flex items-center gap-1.5 mb-2">
+                                  <div className="w-5 h-5 rounded-full bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-[9px] font-bold text-indigo-400">
+                                    {entry.admin.name.charAt(0).toUpperCase()}
+                                  </div>
+                                  <span className="text-[11px] text-neutral-300 font-semibold">{entry.admin.name}</span>
+                                  <Badge variant={entry.admin.role === 'admin' ? 'destructive' : entry.admin.role === 'govt' ? 'warning' : 'info'} className="text-[9px]">
+                                    {entry.admin.role}
+                                  </Badge>
+                                </div>
+                                {entry.note && (
+                                  <div className="flex items-start gap-1.5 p-2 bg-white/[0.02] rounded-lg mb-2">
+                                    <MessageSquare className="w-3 h-3 text-neutral-500 shrink-0 mt-0.5" />
+                                    <p className="text-[10px] text-neutral-400 italic leading-relaxed">&ldquo;{entry.note}&rdquo;</p>
+                                  </div>
+                                )}
+                                <div className="text-[9px] text-neutral-600 font-mono flex items-center gap-1">
+                                  <Clock className="w-2.5 h-2.5" />
+                                  {new Date(entry.loggedAt).toLocaleString()}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </TabsContent>
+                  </Tabs>
+                </CardContent>
+              </Card>
+            </div>
+          ) : (
+            <>
+              <Collapsible open={filterToolsOpen} onOpenChange={setFilterToolsOpen} className="lg:hidden">
+              <CollapsibleTrigger asChild>
+                <button className="flex w-full items-center gap-2 p-4 rounded-lg bg-white/[0.03] border border-white/5 text-xs font-bold text-neutral-300 cursor-pointer select-none">
+                  <Filter className="w-4 h-4 text-indigo-400" />
+                  Filters & Tools
+                </button>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="border border-white/5 border-t-0 rounded-b-lg p-4 space-y-3">
+                {renderSidebarContent()}
+              </CollapsibleContent>
+            </Collapsible>
+
+              <div className="hidden lg:block space-y-4 lg:sticky lg:top-20">
+                {renderSidebarContent()}
               </div>
-            )}
-            {(!userRole || userRole === 'citizen') && (
-              <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl text-center text-neutral-500 text-[11px]">
-                {userRole === 'citizen' ? 'Citizen accounts are read-only.' : 'Sign in with NGO/Govt/Admin to manage.'}
-              </div>
-            )}
-          </div>
-        )}
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
+
+  function renderSidebarContent() {
+    return (
+      <>
+        <Card>
+          <CardContent className="p-4 space-y-3">
+            <div className="relative">
+              <Search className="absolute left-3 top-2.5 w-4 h-4 text-neutral-500" />
+              <Input
+                placeholder="Search issues..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="pl-9"
+              />
+            </div>
+            <Select value={filterCategory} onValueChange={setFilterCategory}>
+              <SelectTrigger>
+                <SelectValue placeholder="All Categories" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Categories</SelectItem>
+                <SelectItem value="infrastructure">Infrastructure</SelectItem>
+                <SelectItem value="sanitation">Sanitation</SelectItem>
+                <SelectItem value="utility">Utility</SelectItem>
+                <SelectItem value="noise">Noise</SelectItem>
+                <SelectItem value="safety">Safety</SelectItem>
+                <SelectItem value="other">Other</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={filterRegion} onValueChange={setFilterRegion}>
+              <SelectTrigger>
+                <SelectValue placeholder="All Regions" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Regions</SelectItem>
+                <SelectItem value="Downtown">Downtown</SelectItem>
+                <SelectItem value="North">North</SelectItem>
+                <SelectItem value="South">South</SelectItem>
+                <SelectItem value="East">East</SelectItem>
+                <SelectItem value="West">West</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={filterStatus} onValueChange={setFilterStatus}>
+              <SelectTrigger>
+                <SelectValue placeholder="All Status" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Status</SelectItem>
+                <SelectItem value="open">Open</SelectItem>
+                <SelectItem value="in_progress">In Progress</SelectItem>
+                <SelectItem value="escalated">Needs Attention</SelectItem>
+                <SelectItem value="resolved">Resolved</SelectItem>
+              </SelectContent>
+            </Select>
+            <div className="flex bg-white/[0.03] p-0.5 rounded-lg border border-white/5">
+              <Button
+                variant={viewMode === 'table' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="flex-1 text-xs"
+                onClick={() => setViewMode('table')}
+              >
+                <List className="w-3.5 h-3.5" /> List
+              </Button>
+              <Button
+                variant={viewMode === 'map' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="flex-1 text-xs"
+                onClick={() => setViewMode('map')}
+              >
+                <Map className="w-3.5 h-3.5" /> Map
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <BarChart3 className="w-4 h-4 text-indigo-400" />
+              <span className="text-[11px] font-bold text-neutral-300 uppercase tracking-wider">By Category</span>
+            </div>
+            {chartData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={160}>
+                <BarChart data={chartData} margin={{ top: 0, right: 0, bottom: 0, left: -20 }}>
+                  <XAxis dataKey="name" tick={{ fontSize: 10, fill: '#737373' }} axisLine={false} tickLine={false} />
+                  <YAxis tick={{ fontSize: 10, fill: '#737373' }} axisLine={false} tickLine={false} />
+                  <Tooltip
+                    contentStyle={{ background: '#18181b', border: '1px solid #27272a', borderRadius: 10, fontSize: 12 }}
+                    cursor={{ fill: 'rgba(255,255,255,0.02)' }}
+                  />
+                  <Bar dataKey="count" radius={[6, 6, 0, 0]} maxBarSize={40}>
+                    {chartData.map((_, idx) => (
+                      <Cell key={idx} fill={chartColors[idx % chartColors.length]} fillOpacity={0.8} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="h-[160px] flex items-center justify-center text-neutral-600 text-xs">No data</div>
+            )}
+          </CardContent>
+        </Card>
+
+        {canViewIngestion && (
+          <IngestionHistoryPanel />
+        )}
+      </>
+    );
+  }
 }

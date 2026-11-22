@@ -57,5 +57,16 @@ export const scoringConfig = {
   // Minimum decay factor — ensures old high-severity clusters never silently vanish.
   // 0.20 means priority never drops below 20% of base severity*cost no matter how old.
   URGENCY_DECAY_FLOOR: parseFloat(process.env.URGENCY_DECAY_FLOOR || '0.20'),
+
+  // ---------------------------------------------------------------------------
+  // HYBRID CLUSTERING configuration (Phase 2)
+  // hybridScore = (semantic * 0.60) + (geo * 0.25) + (temporal * 0.15)
+  // ---------------------------------------------------------------------------
+  HYBRID_SEMANTIC_WEIGHT: parseFloat(process.env.HYBRID_SEMANTIC_WEIGHT || '0.60'),
+  HYBRID_GEO_WEIGHT: parseFloat(process.env.HYBRID_GEO_WEIGHT || '0.25'),
+  HYBRID_TEMPORAL_WEIGHT: parseFloat(process.env.HYBRID_TEMPORAL_WEIGHT || '0.15'),
+  HYBRID_CLUSTER_THRESHOLD: parseFloat(process.env.HYBRID_CLUSTER_THRESHOLD || '0.65'),
+  HYBRID_GEO_RADIUS_KM: parseFloat(process.env.HYBRID_GEO_RADIUS_KM || '5'),
+  HYBRID_TEMPORAL_DECAY_DAYS: parseFloat(process.env.HYBRID_TEMPORAL_DECAY_DAYS || '30'),
 };
 

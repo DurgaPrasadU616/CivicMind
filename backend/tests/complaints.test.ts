@@ -6,6 +6,7 @@ import { clusterComplaint, recalculateClusterSeverity } from '../src/services/cl
 import { getEmbedding } from '../src/services/embeddings';
 import { triggerRecommendationIfNeeded } from '../src/services/recommendations';
 import { updateClusterPriorityScore } from '../src/services/ranking';
+import { cacheDel } from '../src/utils/cache';
 
 // Valid govt JWT for routes that require authentication
 process.env.JWT_SECRET = 'civicmind-super-secret-jwt-key-2026-secure';
@@ -22,9 +23,12 @@ jest.mock('../src/config/db', () => {
   };
 });
 
-// Mock embeddings API
 jest.mock('../src/services/embeddings', () => ({
   getEmbedding: jest.fn(),
+}));
+
+jest.mock('../src/services/assignment', () => ({
+  assignCluster: jest.fn(),
 }));
 
 // Mock the recommendations service to prevent async setImmediate DB calls
@@ -41,6 +45,17 @@ jest.mock('../src/services/recommendations', () => ({
 // from leaking into complaints tests. Tested in isolation in ranking.test.ts.
 jest.mock('../src/services/ranking', () => ({
   updateClusterPriorityScore: jest.fn().mockReturnValue(Promise.resolve(0)),
+}));
+
+// Mock logger to allow assertion of warn/info calls in unit-level tests
+jest.mock('../src/utils/logger', () => ({
+  __esModule: true,
+  default: {
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+  },
 }));
 
 describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
@@ -157,15 +172,20 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
           category: 'sanitation',
           latitude: 12.9838,
           longitude: 77.5885,
+          created_at: new Date(),
         };
 
         // 1. Fetch complaint
         mockPool.query.mockResolvedValueOnce({ rows: [mockComplaint] });
         // 2. Save embedding
         mockPool.query.mockResolvedValueOnce({ rows: [] });
-        // 3. Match cluster (similarity = 0.88, high similarity)
+        // 3. Match cluster (similarity = 0.88, high similarity) — Phase 2: includes hybrid columns
         mockPool.query.mockResolvedValueOnce({
-          rows: [{ id: 202, category: 'sanitation', region: 'North', similarity: '0.88' }],
+          rows: [{
+            id: 202, category: 'sanitation', region: 'North', similarity: '0.88',
+            geo_centroid_lat: '12.9838', geo_centroid_lng: '77.5885',
+            complaint_count: 2, updated_at: new Date(), created_at: new Date(),
+          }],
         });
         // 4. Link complaint
         mockPool.query.mockResolvedValueOnce({ rows: [] });
@@ -176,7 +196,11 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
             { embedding: '[0.025,0.025]' },
           ],
         });
-        // 6. Update centroid vector in cluster
+        // 6. Phase 2 addition: query avg geo coordinates of all geotagged complaints in cluster
+        mockPool.query.mockResolvedValueOnce({
+          rows: [{ avg_lat: '12.9838', avg_lng: '77.5885', cnt: '2' }],
+        });
+        // 7. Update cluster row with centroid + hybrid fields
         mockPool.query.mockResolvedValueOnce({ rows: [] });
 
         // Mocks for severity calculation inside clusterComplaint
@@ -185,6 +209,9 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
         mockPool.query.mockResolvedValueOnce({ rows: [{ count: '2' }] }); // growth
         mockPool.query.mockResolvedValueOnce({ rows: [{ avg_days: '2.0' }] }); // res speed days
         mockPool.query.mockResolvedValueOnce({ rows: [] }); // update
+
+        // Agent execution log
+        mockPool.query.mockResolvedValueOnce({ rows: [{ id: 998 }] });
 
         const assignedId = await clusterComplaint(43);
 
@@ -195,29 +222,42 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
         expect(insertCalled).toBe(false);
       });
 
-      it('should log warning for borderline similarity score threshold matches', async () => {
-        const consoleSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      it('should log warning for borderline hybrid score threshold matches', async () => {
+        // Phase 2: borderline message changed to "Borderline hybrid score detected"
+        // Threshold = 0.65 (Phase 2 default). Borderline margin = ±0.05.
+        // A similarity of 0.72 with geo proximity 0.5 (no coords in cluster row) and temp=1.0:
+        // hybridScore = 0.72*0.60 + 0.5*0.25 + 1.0*0.15 = 0.432 + 0.125 + 0.15 = 0.707
+        // |0.707 - 0.65| = 0.057 > 0.05 → NOT borderline. Use similarity=0.68 instead:
+        // hybridScore = 0.68*0.60 + 0.5*0.25 + 1.0*0.15 = 0.408 + 0.125 + 0.15 = 0.683
+        // |0.683 - 0.65| = 0.033 ≤ 0.05 → borderline warning fires ✓
         const mockComplaint = {
           text: 'Flickering street light on 4th cross.',
           category: 'utility',
           latitude: 12.9691,
           longitude: 77.6083,
+          created_at: new Date(),
         };
 
-        // Threshold = 0.70. Borderline is within 0.05 margin (0.65 to 0.75)
         // 1. Fetch complaint
         mockPool.query.mockResolvedValueOnce({ rows: [mockComplaint] });
         // 2. Save embedding
         mockPool.query.mockResolvedValueOnce({ rows: [] });
-        // 3. Match cluster - similarity 0.72 (borderline above threshold)
+        // 3. Match cluster - similarity 0.68 (borderline above threshold after hybrid scoring)
+        //    No coords on cluster → geo proximity = 0.5 (neutral) → hybridScore ≈ 0.683
         mockPool.query.mockResolvedValueOnce({
-          rows: [{ id: 203, category: 'utility', region: 'East', similarity: '0.72' }],
+          rows: [{
+            id: 203, category: 'utility', region: 'East', similarity: '0.68',
+            geo_centroid_lat: null, geo_centroid_lng: null,
+            complaint_count: 1, updated_at: new Date(), created_at: new Date(),
+          }],
         });
         // 4. Link complaint
         mockPool.query.mockResolvedValueOnce({ rows: [] });
         // 5. Query embeddings
         mockPool.query.mockResolvedValueOnce({ rows: [{ embedding: '[0.025]' }] });
-        // 6. Update centroid
+        // 6. Phase 2: geo avg query
+        mockPool.query.mockResolvedValueOnce({ rows: [{ avg_lat: null, avg_lng: null, cnt: '0' }] });
+        // 7. Update centroid + hybrid fields
         mockPool.query.mockResolvedValueOnce({ rows: [] });
 
         // Severity mock chains
@@ -227,13 +267,17 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
         mockPool.query.mockResolvedValueOnce({ rows: [{ avg_days: null }] });
         mockPool.query.mockResolvedValueOnce({ rows: [] });
 
+        // Agent execution log
+        mockPool.query.mockResolvedValueOnce({ rows: [{ id: 997 }] });
+
         await clusterComplaint(44);
 
-        // Verify borderline warning console logged
-        expect(consoleSpy).toHaveBeenCalledWith(
-          expect.stringContaining('[CLUSTERING] Borderline similarity score detected')
+        // Phase 2: warning message is "Borderline hybrid score detected" (not "similarity score")
+        // Verify logger.warn was called (logger is mocked, not console.warn)
+        const loggerMock = jest.requireMock('../src/utils/logger').default;
+        expect(loggerMock.warn).toHaveBeenCalledWith(
+          expect.stringContaining('Borderline hybrid score detected')
         );
-        consoleSpy.mockRestore();
       });
     });
   });
@@ -276,6 +320,10 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
       mockPool.query.mockResolvedValueOnce({ rows: [{ avg_days: null }] }); // speed
       mockPool.query.mockResolvedValueOnce({ rows: [] }); // update cluster
 
+      // Agent execution log insert (clusterComplaint step 8 — runs before the route's
+      // final SELECT, so it must consume its own mock)
+      mockPool.query.mockResolvedValueOnce({ rows: [{ id: 901 }] });
+
       // -- Post-Clustering return query --
       mockPool.query.mockResolvedValueOnce({
         rows: [
@@ -293,11 +341,71 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
       });
 
       const response = await request(app).post('/api/complaints').send(payload);
+      
+      console.log('[TEST RESPONSE BODY]', response.body);
 
       expect(response.status).toBe(201);
       expect(response.body.message).toContain('clustered successfully');
       expect(response.body.data.id).toBe(50);
       expect(response.body.data.cluster_id).toBe(301);
+    });
+
+    it('POST /api/complaints stamps the JWT user id into meta_data (ignores any client-supplied userId)', async () => {
+      // Same mock chain as the submit test above
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // idempotency
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // duplicate spam
+      mockPool.query.mockResolvedValueOnce({ rows: [{ id: 1 }] }); // source
+      mockPool.query.mockResolvedValueOnce({ rows: [{ id: 51 }] }); // insert
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ text: 'Water pipeline leakage.', category: 'utility', latitude: 12.9716, longitude: 77.5946 }],
+      });
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // embedding update
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // closest cluster
+      mockPool.query.mockResolvedValueOnce({ rows: [{ id: 302 }] }); // insert cluster
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // link complaint
+      mockPool.query.mockResolvedValueOnce({ rows: [{ category: 'utility' }] }); // severity
+      mockPool.query.mockResolvedValueOnce({ rows: [{ count: '1' }] });
+      mockPool.query.mockResolvedValueOnce({ rows: [{ count: '1' }] });
+      mockPool.query.mockResolvedValueOnce({ rows: [{ avg_days: null }] });
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // update cluster
+      mockPool.query.mockResolvedValueOnce({ rows: [{ id: 902 }] }); // agent log
+      mockPool.query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 51,
+            category: 'utility',
+            text: 'Water pipeline leakage.',
+            latitude: 12.9716,
+            longitude: 77.5946,
+            status: 'pending',
+            created_at: '2026-11-18T18:00:00Z',
+            cluster_id: 302,
+          },
+        ],
+      });
+
+      const citizenToken = jwt.sign(
+        { id: 777, role: 'citizen' },
+        process.env.JWT_SECRET!,
+        { expiresIn: '1h' }
+      );
+
+      const response = await request(app)
+        .post('/api/complaints')
+        .set('Authorization', `Bearer ${citizenToken}`)
+        .send({ ...payload, metaData: { userId: 12345, spoofed: true } });
+
+      expect(response.status).toBe(201);
+
+      const insertCall = mockPool.query.mock.calls.find(
+        (c) => typeof c[0] === 'string' && c[0].includes('INSERT INTO complaint')
+      );
+      expect(insertCall).toBeDefined();
+
+      const storedMetaData = JSON.parse(insertCall[1][6]);
+      // Ownership comes from the verified token, never from the request body
+      expect(storedMetaData.userId).toBe(777);
+      expect(storedMetaData.spoofed).toBe(true); // other client metadata is kept
     });
 
     it('GET /api/clusters should query database clusters and return aggregated JSON arrays', async () => {
@@ -322,6 +430,9 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
         latestActionGeneratedAt: null,
       };
 
+      // 1. COUNT(*) query (route computes meta.total before the main query)
+      mockPool.query.mockResolvedValueOnce({ rows: [{ count: '1' }] });
+      // 2. Main aggregated cluster query
       mockPool.query.mockResolvedValueOnce({
         rows: [mockClusterRecord],
       });
@@ -724,6 +835,10 @@ describe('CivicMind AI E2E Vector Clustering & Severity Tests', () => {
     });
 
     it('should return 500 gracefully when DB throws on GET /api/clusters', async () => {
+      // Clear the 60s response cache populated by the earlier successful
+      // GET /api/clusters test, otherwise the cached 200 would mask the DB error.
+      await cacheDel('clusters:all:all:all:all:');
+
       mockPool.query.mockRejectedValueOnce(new Error('Deadlock detected'));
 
       const response = await request(app).get('/api/clusters');

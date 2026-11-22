@@ -1,3 +1,4 @@
+import logger from '../src/utils/logger';
 // backend/tests/ranking.test.ts
 // Unit and integration tests for the priority_score ranking service.
 // Tests are pure-function only (no DB needed for the core math);
@@ -92,14 +93,14 @@ describe('Ranking Service — priority_score', () => {
     });
 
     it('should return 1.0 (neutral) for an unknown/missing category', () => {
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation((() => {}) as any);
       const result = getResourceCostFactor('alien_tech');
       expect(result).toBe(1.0);
       warnSpy.mockRestore();
     });
 
     it('should log a warning when category is not in config', () => {
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation((() => {}) as any);
       getResourceCostFactor('unconfigured_type');
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('No resource_cost_factor')
@@ -111,7 +112,7 @@ describe('Ranking Service — priority_score', () => {
     });
 
     it('should NOT log a warning for known categories', () => {
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation((() => {}) as any);
       getResourceCostFactor('safety');
       expect(warnSpy).not.toHaveBeenCalled();
       warnSpy.mockRestore();
@@ -147,7 +148,7 @@ describe('Ranking Service — priority_score', () => {
     });
 
     it('missing resource_cost_factor falls back to 1.0 (neutral)', () => {
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation((() => {}) as any);
       // severity=50, days=0, category not in config → factor=1.0
       const result = computePriorityScore(50, 0, 'unknown_category');
       expect(result).toBe(50); // 50 * 1.0 * 1.0 = 50
@@ -256,7 +257,7 @@ describe('Ranking Service — priority_score', () => {
     });
 
     it('should warn and use 1.0 factor when category is unknown', async () => {
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation((() => {}) as any);
       mockPool.query.mockResolvedValueOnce({
         rows: [{ category: 'mystery', days_since_first: '0' }],
       });

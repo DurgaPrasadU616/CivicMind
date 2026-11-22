@@ -1,64 +1,83 @@
 @import "tailwindcss";
 
-:root {
-  --background: #08080c;
-  --foreground: #f3f4f6;
-  --card-bg: rgba(16, 16, 22, 0.7);
-  --card-border: rgba(255, 255, 255, 0.06);
-  --sidebar-bg: #0c0c10;
-  --topbar-bg: rgba(8, 8, 12, 0.85);
-  --accent: #6366f1;
-  --accent-light: #818cf8;
+@theme inline {
+  --color-base: #08080c;
+  --color-surface: #0c0c10;
+  --color-card: #1a1a1f;
+  --color-card-hover: #22222a;
+
+  --color-primary: #6366f1;
+  --color-primary-light: #818cf8;
+  --color-primary-dark: #4f46e5;
+
+  --color-severity-critical: #ef4444;
+  --color-severity-medium: #f59e0b;
+  --color-severity-low: #22c55e;
+
+  --color-status-open: #f59e0b;
+  --color-status-progress: #6366f1;
+  --color-status-resolved: #22c55e;
+  --color-status-escalated: #ef4444;
+
+  --color-text-primary: #f3f4f6;
+  --color-text-muted: #a1a1aa;
+  --color-text-dim: #52525b;
+
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
+  --color-border-default: rgba(255, 255, 255, 0.1);
+
+  --radius-button: 0.5rem;
+  --radius-card: 0.5rem;
+  --radius-badge: 0.5rem;
+  --radius-input: 0.5rem;
+
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-neutral-850: #1a1a1f;
-  --color-neutral-925: #0b0b0d;
+@layer utilities {
+  .text-heading {
+    @apply text-sm font-semibold text-neutral-200;
+  }
+  .text-caption {
+    @apply text-xs text-neutral-500;
+  }
+  .text-meta {
+    @apply text-[11px] text-neutral-500;
+  }
 }
 
 body {
-  background-color: var(--background);
-  color: var(--foreground);
+  background-color: var(--color-base);
+  color: var(--color-text-primary);
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 0.875rem;
   overflow-x: hidden;
 }
 
-/* Card system */
-.cm-card {
-  background: var(--card-bg);
-  border: 1px solid var(--card-border);
-  border-radius: 16px;
-  backdrop-filter: blur(12px);
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
-.cm-card-sm {
-  background: var(--card-bg);
-  border: 1px solid var(--card-border);
-  border-radius: 12px;
-  backdrop-filter: blur(12px);
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(8px); }
+  to { opacity: 1; transform: translateX(0); }
 }
 
-/* Stat card hover effect */
-.stat-card {
-  transition: all 0.2s ease;
-}
-.stat-card:hover {
-  transform: translateY(-2px);
-  border-color: rgba(255, 255, 255, 0.1);
-  box-shadow: 0 8px 25px -5px rgba(0, 0, 0, 0.3);
+@keyframes shimmer {
+  0% { opacity: 0.4; }
+  50% { opacity: 0.7; }
+  100% { opacity: 0.4; }
 }
 
-/* Table rows */
-.table-row {
-  transition: background 0.15s ease;
-}
-.table-row:hover {
-  background: rgba(255, 255, 255, 0.02);
+.fade-in {
+  animation: fadeIn 0.2s ease-out;
 }
 
-/* Scrollbar */
+.slide-in {
+  animation: slideIn 0.2s ease-out;
+}
+
 ::-webkit-scrollbar {
   width: 5px;
   height: 5px;
@@ -72,28 +91,4 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #3f3f46;
-}
-
-/* Slide-in panel */
-.slide-panel {
-  animation: slideIn 0.2s ease-out;
-}
-@keyframes slideIn {
-  from {
-    opacity: 0;
-    transform: translateX(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
-
-/* Fade in */
-.fade-in {
-  animation: fadeIn 0.25s ease-out;
-}
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
 }

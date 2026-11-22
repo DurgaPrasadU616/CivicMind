@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 import { pool } from '../config/db';
 import { env } from '../config/env';
 import { registerSchema, loginSchema } from '../validators/auth';
+import logger from '../utils/logger';
 
 const router = Router();
 
@@ -61,7 +62,7 @@ router.post('/auth/register', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error during registration:', error);
+    logger.error('Error during registration:', error);
     return res.status(500).json({ error: 'An internal server error occurred during registration.' });
   }
 });
@@ -112,9 +113,14 @@ router.post('/auth/login', async (req, res) => {
       expiresIn: env.JWT_EXPIRES_IN as any,
     });
 
+    const refreshToken = jwt.sign(payload, env.JWT_REFRESH_SECRET || env.JWT_SECRET!, {
+      expiresIn: env.JWT_REFRESH_EXPIRES_IN as any,
+    });
+
     return res.status(200).json({
       message: 'Login successful.',
       token,
+      refreshToken,
       user: {
         id: user.id,
         name: user.name,
@@ -123,8 +129,41 @@ router.post('/auth/login', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error during login:', error);
+    logger.error('Error during login:', error);
     return res.status(500).json({ error: 'An internal server error occurred during login.' });
+  }
+});
+
+// POST /api/auth/refresh
+router.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) {
+      return res.status(400).json({ error: 'Refresh token is required.' });
+    }
+
+    jwt.verify(refreshToken, env.JWT_REFRESH_SECRET || env.JWT_SECRET!, (err: any, decoded: any) => {
+      if (err) {
+        return res.status(403).json({ error: 'Invalid or expired refresh token.' });
+      }
+
+      const payload = { id: decoded.id, role: decoded.role };
+      const newToken = jwt.sign(payload, env.JWT_SECRET!, {
+        expiresIn: env.JWT_EXPIRES_IN as any,
+      });
+
+      const newRefreshToken = jwt.sign(payload, env.JWT_REFRESH_SECRET || env.JWT_SECRET!, {
+        expiresIn: env.JWT_REFRESH_EXPIRES_IN as any,
+      });
+
+      return res.status(200).json({
+        token: newToken,
+        refreshToken: newRefreshToken,
+      });
+    });
+  } catch (error) {
+    logger.error('Error during token refresh:', error);
+    return res.status(500).json({ error: 'An internal server error occurred during token refresh.' });
   }
 });
 

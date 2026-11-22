@@ -1,3 +1,24 @@
+jest.mock('@google/generative-ai', () => {
+  return {
+    GoogleGenerativeAI: class {
+      getGenerativeModel() {
+        return {
+          generateContent: jest.fn().mockImplementation(async () => {
+            if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.includes('invalid')) {
+              throw new Error('API key not valid');
+            }
+            return {
+              response: {
+                text: () => 'Mocked Gemini action recommendation.',
+              },
+            };
+          }),
+        };
+      }
+    },
+  };
+});
+
 import request from 'supertest';
 import app from '../src/index';
 import { pool } from '../src/config/db';
@@ -19,6 +40,10 @@ jest.mock('../src/config/db', () => {
 
 jest.mock('../src/services/embeddings', () => ({
   getEmbedding: jest.fn(),
+}));
+
+jest.mock('../src/services/assignment', () => ({
+  assignCluster: jest.fn(),
 }));
 
 // Mock ranking service to prevent priority DB queries bleeding into recommendation tests
@@ -153,17 +178,7 @@ describe('Recommendations Service — Unit Tests', () => {
       mockPool.query.mockResolvedValueOnce({ rows: [] }); // insert
       mockPool.query.mockResolvedValueOnce({ rows: [] }); // update cluster
 
-      // The GoogleGenerativeAI will throw because the key is invalid
-      // generateWithGemini is internal, but we know it will fail with a bad key
-      // We mock the @google/generative-ai to throw
-      jest.mock('@google/generative-ai', () => ({
-        GoogleGenerativeAI: jest.fn().mockImplementation(() => ({
-          getGenerativeModel: jest.fn().mockReturnValue({
-            generateContent: jest.fn().mockRejectedValue(new Error('API key not valid')),
-          }),
-        })),
-      }));
-
+      // The GoogleGenerativeAI will throw because the key is invalid since it has 'invalid' in it.
       await generateRecommendedAction(202);
 
       const insertCall = mockPool.query.mock.calls.find(
@@ -172,6 +187,89 @@ describe('Recommendations Service — Unit Tests', () => {
 
       // Whether Gemini fails or succeeds with an invalid key, we always get an insert
       expect(insertCall).toBeDefined();
+
+      delete process.env.GEMINI_API_KEY;
+    });
+
+    it('should use RAG retrieval and compute confidence score when centroid is provided', async () => {
+      process.env.GEMINI_API_KEY = 'test-key';
+      
+      // DB mocks
+      // 1. Cluster context with centroid
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ category: 'sanitation', region: 'North', complaint_count: '3', severity_score: '55', centroid: '[0.1, 0.2]' }],
+      });
+      // 2. Sample complaints
+      mockPool.query.mockResolvedValueOnce({ rows: [{ text: 'Garbage overflow.' }] });
+      // 3. Past clusters
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ title: 'Old Garbage', category: 'sanitation', action_text: 'Clean it up', similarity: 0.8 }]
+      });
+      // 4. Guidelines
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ title: 'Garbage SOP', source: 'SOP', content: 'Clean in 8h', similarity: 0.9 }]
+      });
+      // 5. supersede
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); 
+      // 6. insert
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); 
+      // 7. update cluster
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); 
+
+      await generateRecommendedAction(203);
+
+      const insertCall = mockPool.query.mock.calls.find(
+        (c) => typeof c[0] === 'string' && c[0].includes('INSERT INTO recommended_action')
+      );
+
+      expect(insertCall).toBeDefined();
+      const [, params] = insertCall!;
+      
+      // retrieved_context
+      const retrievedContext = JSON.parse(params[3]);
+      expect(retrievedContext.pastCases).toHaveLength(1);
+      expect(retrievedContext.pastCases[0].title).toBe('Old Garbage');
+      expect(retrievedContext.guidelines).toHaveLength(1);
+      expect(retrievedContext.guidelines[0].title).toBe('Garbage SOP');
+      expect(retrievedContext.coldStart).toBe(false);
+
+      // confidence_score = (0.8 + 0.9) / 2 * 100 = 85
+      expect(params[4]).toBe(85);
+
+      delete process.env.GEMINI_API_KEY;
+    });
+
+    it('should correctly handle cold start (no past cases)', async () => {
+      process.env.GEMINI_API_KEY = 'test-key';
+      
+      // DB mocks
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ category: 'safety', region: 'South', complaint_count: '2', severity_score: '60', centroid: '[0.1]' }],
+      });
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // samples
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // past cases EMPTY
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ title: 'Safety SOP', source: 'Police', content: 'Respond', similarity: 0.7 }]
+      }); // guidelines
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // supersede
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // insert
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // update cluster
+
+      await generateRecommendedAction(204);
+
+      const insertCall = mockPool.query.mock.calls.find(
+        (c) => typeof c[0] === 'string' && c[0].includes('INSERT INTO recommended_action')
+      );
+
+      expect(insertCall).toBeDefined();
+      const [, params] = insertCall!;
+      
+      const retrievedContext = JSON.parse(params[3]);
+      expect(retrievedContext.pastCases).toHaveLength(0);
+      expect(retrievedContext.coldStart).toBe(true);
+
+      // confidence_score = 0.7 * 100 = 70
+      expect(params[4]).toBe(70);
 
       delete process.env.GEMINI_API_KEY;
     });
@@ -301,9 +399,23 @@ describe('Recommendations Service — Unit Tests', () => {
         .mockResolvedValueOnce({ rows: [{ count: '1' }] })
         .mockResolvedValueOnce({ rows: [{ avg_days: null }] })
         .mockResolvedValueOnce({ rows: [] })
-        // triggerRecommendationIfNeeded
+        // agent execution log insert (clusterComplaint step 8 — synchronous, before the
+        // route's final SELECT, so it must have its own mock slot)
+        .mockResolvedValueOnce({ rows: [{ id: 902 }] })
+        // return complaint (route's final SELECT — response is sent right after this)
+        .mockResolvedValueOnce({
+          rows: [{ id: 99, category: 'noise', text: 'Test.', latitude: 12.97, longitude: 77.59, status: 'pending', created_at: new Date().toISOString(), cluster_id: 500 }],
+        })
+        // ── Background job (trigger_recommendation_cluster_500) ────────────────
+        // Blocks until the HTTP response has been received. This makes the
+        // non-blocking assertion deterministic: if the route ever awaited
+        // recommendation generation, the response would never arrive and the
+        // test would time out instead of passing spuriously.
         .mockImplementationOnce(async () => {
           events.push('recommendation_query_started');
+          while (!events.includes('response_received')) {
+            await new Promise((r) => setTimeout(r, 1));
+          }
           return { rows: [{ last_severity_band: null }] };
         })
         .mockResolvedValueOnce({ rows: [] }) // UPDATE band
@@ -315,11 +427,7 @@ describe('Recommendations Service — Unit Tests', () => {
         .mockResolvedValueOnce({ rows: [] }) // sample complaints
         .mockResolvedValueOnce({ rows: [] }) // supersede
         .mockResolvedValueOnce({ rows: [] }) // insert action
-        .mockResolvedValueOnce({ rows: [] }) // update cluster recommended_action
-        // return complaint
-        .mockResolvedValueOnce({
-          rows: [{ id: 99, category: 'noise', text: 'Test.', latitude: 12.97, longitude: 77.59, status: 'pending', created_at: new Date().toISOString(), cluster_id: 500 }],
-        });
+        .mockResolvedValueOnce({ rows: [] }); // update cluster recommended_action
 
       events.push('request_sent');
       const response = await request(app).post('/api/complaints').send({

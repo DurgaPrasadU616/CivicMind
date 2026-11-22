@@ -8,6 +8,7 @@
 import { XMLParser } from 'fast-xml-parser';
 import { getSourceId, generateIdempotencyKey, insertAndCluster } from './common';
 import { logIngestionRun } from './ingestionLogService';
+import logger from '../../utils/logger';
 
 // ── Feed configuration ──────────────────────────────────────────────────────
 const RSS_FEEDS = [
@@ -82,7 +83,7 @@ const fetchFeed = async (url: string): Promise<FetchFeedResult> => {
     clearTimeout(timeout);
 
     if (!response.ok) {
-      console.warn(`[NEWS] RSS fetch failed for ${url}: HTTP ${response.status}`);
+      logger.warn(`[NEWS] RSS fetch failed for ${url}: HTTP ${response.status}`);
       return { url, success: false, items: [], error: `HTTP ${response.status}` };
     }
 
@@ -104,7 +105,7 @@ const fetchFeed = async (url: string): Promise<FetchFeedResult> => {
     return { url, success: true, items };
   } catch (err: any) {
     const errorMsg = err.name === 'AbortError' ? 'Timeout' : err.message;
-    console.warn(`[NEWS] RSS fetch error for ${url}: ${errorMsg}`);
+    logger.warn(`[NEWS] RSS fetch error for ${url}: ${errorMsg}`);
     return { url, success: false, items: [], error: errorMsg };
   }
 };
@@ -162,7 +163,7 @@ export const ingestNewsFeeds = async (customFeeds?: string[]): Promise<NewsInges
   const allItems = successfulFeeds.flatMap((f) => f.items);
   result.totalFetched = allItems.length;
 
-  console.log(`[NEWS] Fetched ${allItems.length} RSS items from ${successfulFeeds.length}/${feedsToUse.length} feeds`);
+  logger.info(`[NEWS] Fetched ${allItems.length} RSS items from ${successfulFeeds.length}/${feedsToUse.length} feeds`);
 
   // Deduplicate across feeds
   const seenTitles = new Set<string>();
@@ -226,7 +227,7 @@ export const ingestNewsFeeds = async (customFeeds?: string[]): Promise<NewsInges
     status: result.status,
   });
 
-  console.log(
+  logger.info(
     `[NEWS] Ingestion complete (status: ${result.status}): ${result.insertedCount} new, ` +
     `${result.skippedDuplicate} duplicate-skipped, ${result.relevantCount} relevant`
   );

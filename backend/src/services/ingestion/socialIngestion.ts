@@ -7,6 +7,7 @@
 
 import { getSourceId, generateIdempotencyKey, insertAndCluster } from './common';
 import { logIngestionRun } from './ingestionLogService';
+import logger from '../../utils/logger';
 
 interface MockSocialPost {
   author: string;
@@ -232,7 +233,7 @@ export const ingestSocialMediaPosts = async (posts?: MockSocialPost[]): Promise<
     return result;
   }
 
-  console.log(`[SOCIAL] Ingesting ${postsToUse.length} simulated social media posts...`);
+  logger.info(`[SOCIAL] Ingesting ${postsToUse.length} simulated social media posts...`);
 
   for (const post of postsToUse) {
     const category = inferCategory(post.text);
@@ -284,7 +285,7 @@ export const ingestSocialMediaPosts = async (posts?: MockSocialPost[]): Promise<
     status: result.status,
   });
 
-  console.log(
+  logger.info(
     `[SOCIAL] Ingestion complete (status: ${result.status}): ${result.insertedCount} new, ` +
     `${result.skippedDuplicate} duplicate-skipped out of ${result.totalPosts} posts`
   );

@@ -1,12 +1,13 @@
 import { pool } from './db';
 import { clusterComplaint } from '../services/clustering';
+import logger from '../utils/logger';
 
 export const seedDatabaseIfEmpty = async () => {
   if (!pool) return;
   try {
     const checkTable = await pool.query("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'complaint')");
     if (!checkTable.rows[0].exists) {
-      console.warn('⚠️ complaint table does not exist. Skipping seed.');
+      logger.warn('⚠️ complaint table does not exist. Skipping seed.');
       return;
     }
 
@@ -16,7 +17,7 @@ export const seedDatabaseIfEmpty = async () => {
       return; // Already populated
     }
 
-    console.log('🌱 Database is empty. Seeding and clustering initial complaints...');
+    logger.info('🌱 Database is empty. Seeding and clustering initial complaints...');
 
     // Get source IDs
     const sourceRes = await pool.query('SELECT id, name FROM source');
@@ -27,7 +28,7 @@ export const seedDatabaseIfEmpty = async () => {
 
     const portalId = sources['citizen_portal'];
     if (!portalId) {
-      console.error('❌ Cannot seed database: "citizen_portal" source record not found.');
+      logger.error('❌ Cannot seed database: "citizen_portal" source record not found.');
       return;
     }
 
@@ -116,8 +117,8 @@ export const seedDatabaseIfEmpty = async () => {
         await clusterComplaint(id);
       }
     }
-    console.log('✅ Successfully seeded and clustered complaints database.');
+    logger.info('✅ Successfully seeded and clustered complaints database.');
   } catch (error) {
-    console.error('❌ Error seeding complaints table:', error);
+    logger.error('❌ Error seeding complaints table:', error);
   }
 };

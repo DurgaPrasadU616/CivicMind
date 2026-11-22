@@ -4,8 +4,10 @@ import { env } from '../config/env';
 import { createComplaintSchema } from '../validators/complaint';
 import { clusterComplaint } from '../services/clustering';
 import { updateClusterPriorityScore } from '../services/ranking';
-import { authenticateToken, requireRole } from '../middleware/auth';
-import rateLimit from 'express-rate-limit';
+import { authenticateToken, requireRole, optionalAuth } from '../middleware/auth';
+import { rateLimit, cacheGet, cacheSet } from '../utils/cache';
+import logger from '../utils/logger';
+import { backgroundQueue } from '../services/backgroundQueue';
 
 const router = Router();
 
@@ -13,12 +15,9 @@ const router = Router();
 // max defaults to 100 per 15 min per IP; RATE_LIMIT_MAX env var overrides (useful in tests).
 const submitLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: env.RATE_LIMIT_MAX,
-  message: {
-    error: 'Too many complaint submissions from this IP. Please try again later.',
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
+  max: env.RATE_LIMIT_MAX || 100,
+  keyPrefix: 'complaints_submit:',
+  message: 'Too many complaint submissions from this IP. Please try again later.',
 });
 
 // Helper: Determine Region based on GPS Coordinates
@@ -31,7 +30,33 @@ const getRegionFromCoords = (lat: number, lng: number): 'Downtown' | 'North' | '
 };
 
 // POST /api/complaints: Submit a new complaint, generate embedding, cluster, and recalculate severity
-router.post('/complaints', submitLimiter, async (req, res) => {
+/**
+ * @openapi
+ * /complaints:
+ *   post:
+ *     summary: Submit a new civic complaint
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               text:
+ *                 type: string
+ *               category:
+ *                 type: string
+ *               latitude:
+ *                 type: number
+ *               longitude:
+ *                 type: number
+ *               idempotencyKey:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Complaint successfully created or updated
+ */
+router.post('/complaints', optionalAuth, submitLimiter, async (req, res) => {
   try {
     // 1. Validate payload
     const result = createComplaintSchema.safeParse(req.body);
@@ -46,6 +71,15 @@ router.post('/complaints', submitLimiter, async (req, res) => {
     }
 
     const { text, category, latitude, longitude, idempotencyKey, metaData } = result.data;
+
+    // Server-side ownership stamp: meta_data.userId drives media ownership
+    // checks, so it must come from the verified JWT — never from the client.
+    const serverMetaData: Record<string, unknown> = { ...(metaData || {}) };
+    if (req.user?.id !== undefined) {
+      serverMetaData.userId = req.user.id;
+    } else {
+      delete serverMetaData.userId;
+    }
 
     // 2. Safeguard database query calls if pool is unconfigured or errors out
     if (!pool) {
@@ -99,7 +133,7 @@ router.post('/complaints', submitLimiter, async (req, res) => {
         latitude !== undefined ? latitude : null,
         longitude !== undefined ? longitude : null,
         idempotencyKey,
-        JSON.stringify(metaData || {}),
+        JSON.stringify(serverMetaData),
       ]
     );
 
@@ -120,7 +154,7 @@ router.post('/complaints', submitLimiter, async (req, res) => {
       clusterId: `CL-${assignedClusterId}`,
     });
   } catch (error) {
-    console.error('Error handling complaint submission:', error);
+    logger.error('Error handling complaint submission:', error);
     return res.status(500).json({
       error: 'An internal server error occurred while processing the complaint.',
     });
@@ -167,7 +201,7 @@ router.get('/complaints/:id', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error fetching complaint details:', error);
+    logger.error('Error fetching complaint details:', error);
     return res.status(500).json({
       error: 'An internal server error occurred while retrieving complaint status.',
     });
@@ -182,10 +216,21 @@ router.get('/clusters', async (req, res) => {
     }
 
     // Parse query filters
-    const { category, region, status, search } = req.query;
+    const { category, region, status, search, id } = req.query;
+
+    const cacheKey = `clusters:${id || 'all'}:${category || 'all'}:${region || 'all'}:${status || 'all'}:${search || ''}`;
+    const cachedData = await cacheGet(cacheKey);
+    if (cachedData) {
+      return res.status(200).json({ data: cachedData });
+    }
 
     const conditions: string[] = [];
     const params: any[] = [];
+
+    if (id) {
+      params.push(parseInt(String(id).replace('CL-', ''), 10));
+      conditions.push(`cl.id = $${params.length}`);
+    }
 
     if (category && category !== 'all') {
       params.push(category);
@@ -207,7 +252,14 @@ router.get('/clusters', async (req, res) => {
       conditions.push(`(cl.title ILIKE $${params.length} OR cl.recommended_action ILIKE $${params.length})`);
     }
 
+    const limitVal = parseInt((req.query.limit as string) || '50', 10);
+    const offsetVal = parseInt((req.query.offset as string) || '0', 10);
+
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countQuery = `SELECT COUNT(*) FROM cluster cl ${whereClause}`;
+    const totalResult = await pool.query(countQuery, params);
+    const totalCount = parseInt(totalResult.rows[0].count, 10);
 
     // Advanced SQL Join with dynamic averages, JSON aggregation, latest recommended action,
     // and priority_score. Sorted by priority_score DESC as default (staleness-aware ranking).
@@ -221,8 +273,13 @@ router.get('/clusters', async (req, res) => {
         cl.region,
         cl.severity_score as severity,
         COALESCE(cl.priority_score, cl.severity_score) as "priorityScore",
+        COALESCE(cl.hybrid_score, 0) as "hybridScore",
+        cl.geo_centroid_lat as "geoCentroidLat",
+        cl.geo_centroid_lng as "geoCentroidLng",
+        COALESCE(cl.temporal_weight, 1.0) as "temporalWeight",
         cl.complaint_count as "complaintCount",
         cl.status,
+        cl.needs_review as "needsReview",
         cl.recommended_action as "recommendedAction",
         COALESCE(AVG(co.latitude), 12.9716) as latitude,
         COALESCE(AVG(co.longitude), 77.5946) as longitude,
@@ -242,41 +299,108 @@ router.get('/clusters', async (req, res) => {
         la.action_text as "latestActionText",
         la.generated_by as "latestActionGeneratedBy",
         la.status as "latestActionStatus",
-        la.generated_at as "latestActionGeneratedAt"
+        la.generated_at as "latestActionGeneratedAt",
+        la.retrieved_context as "latestActionRetrievedContext",
+        la.confidence_score as "latestActionConfidenceScore"
       FROM cluster cl
       LEFT JOIN complaint co ON cl.id = co.cluster_id
       LEFT JOIN source s ON co.source_id = s.id
       LEFT JOIN LATERAL (
-        SELECT action_text, generated_by, status, generated_at
+        SELECT action_text, generated_by, status, generated_at, retrieved_context, confidence_score
         FROM recommended_action
         WHERE cluster_id = cl.id
         ORDER BY generated_at DESC
         LIMIT 1
       ) la ON true
       ${whereClause}
-      GROUP BY cl.id, la.action_text, la.generated_by, la.status, la.generated_at
+      GROUP BY cl.id, la.action_text, la.generated_by, la.status, la.generated_at, la.retrieved_context, la.confidence_score
       ORDER BY
         COALESCE(cl.priority_score, cl.severity_score) DESC,
         cl.complaint_count DESC,
         COALESCE(MAX(co.created_at), cl.updated_at) DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
     `;
 
-    const clustersRes = await pool.query(query, params);
+    // Migration-safe query: if migration 011 columns (hybrid_score, geo_centroid_lat, etc.)
+    // are not yet applied to the database, fall back to the base query without those columns.
+    // PostgreSQL error code 42703 = "column does not exist".
+    let clustersRes: { rows: any[] };
+    try {
+      clustersRes = await pool.query(query, [...params, limitVal, offsetVal]);
+    } catch (queryErr: any) {
+      if (queryErr?.code === '42703') {
+        logger.warn('[CLUSTERS] Migration 011 columns not found, falling back to base query without hybrid fields');
+        const baseQuery = `
+          SELECT 
+            cl.id,
+            cl.title,
+            cl.category,
+            cl.region,
+            cl.severity_score as severity,
+            COALESCE(cl.priority_score, cl.severity_score) as "priorityScore",
+            cl.complaint_count as "complaintCount",
+            cl.status,
+            cl.needs_review as "needsReview",
+            cl.recommended_action as "recommendedAction",
+            COALESCE(AVG(co.latitude), 12.9716) as latitude,
+            COALESCE(AVG(co.longitude), 77.5946) as longitude,
+            COALESCE(MAX(co.created_at), cl.updated_at) as "lastUpdated",
+            COALESCE(
+              json_agg(
+                json_build_object(
+                  'id', 'CM-' || co.id,
+                  'text', co.text,
+                  'status', co.status,
+                  'created_at', co.created_at,
+                  'source_name', COALESCE(s.name, 'unknown')
+                )
+              ) FILTER (WHERE co.id IS NOT NULL),
+              '[]'::json
+            ) as complaints,
+            la.action_text as "latestActionText",
+            la.generated_by as "latestActionGeneratedBy",
+            la.status as "latestActionStatus",
+            la.generated_at as "latestActionGeneratedAt",
+            la.retrieved_context as "latestActionRetrievedContext",
+            la.confidence_score as "latestActionConfidenceScore"
+          FROM cluster cl
+          LEFT JOIN complaint co ON cl.id = co.cluster_id
+          LEFT JOIN source s ON co.source_id = s.id
+          LEFT JOIN LATERAL (
+            SELECT action_text, generated_by, status, generated_at, retrieved_context, confidence_score
+            FROM recommended_action
+            WHERE cluster_id = cl.id
+            ORDER BY generated_at DESC
+            LIMIT 1
+          ) la ON true
+          ${whereClause}
+          GROUP BY cl.id, la.action_text, la.generated_by, la.status, la.generated_at, la.retrieved_context, la.confidence_score
+          ORDER BY
+            COALESCE(cl.priority_score, cl.severity_score) DESC,
+            cl.complaint_count DESC,
+            COALESCE(MAX(co.created_at), cl.updated_at) DESC
+          LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+        `;
+        clustersRes = await pool.query(baseQuery, [...params, limitVal, offsetVal]);
+      } else {
+        throw queryErr;
+      }
+    }
 
     // Stopgap: asynchronously refresh priority_score for each cluster so staleness/decay
     // is applied even without a dedicated cron job.
     // TODO: Replace with a scheduled cron job that recalculates priority on a fixed interval.
     if (clustersRes.rows.length > 0) {
-      setImmediate(() => {
+      backgroundQueue.enqueue('refresh_priority_scores', async () => {
         const refreshPromises = clustersRes.rows.map((row) =>
           updateClusterPriorityScore(
             row.id,
             row.severity != null ? parseInt(row.severity, 10) : 0
           ).catch((err) =>
-            console.warn(`[RANKING] Background priority refresh failed for Cluster ${row.id}:`, err)
+            logger.warn(`[RANKING] Background priority refresh failed for Cluster ${row.id}:`, err)
           )
         );
-        Promise.all(refreshPromises).catch(() => {});
+        await Promise.all(refreshPromises);
       });
     }
 
@@ -287,9 +411,14 @@ router.get('/clusters', async (req, res) => {
       category: row.category,
       region: row.region,
       severity: parseInt(row.severity, 10),
-      priorityScore: parseInt(row.priorityScore, 10),
+      priorityScore: parseFloat(row.priorityScore),
+      hybridScore: row.hybridScore != null ? parseFloat(row.hybridScore) : undefined,
+      geoCentroidLat: row.geoCentroidLat != null ? parseFloat(row.geoCentroidLat) : undefined,
+      geoCentroidLng: row.geoCentroidLng != null ? parseFloat(row.geoCentroidLng) : undefined,
+      temporalWeight: row.temporalWeight != null ? parseFloat(row.temporalWeight) : undefined,
       complaintCount: parseInt(row.complaintCount, 10),
       status: row.status,
+      needsReview: row.needsReview ?? false,
       recommendedAction: row.recommendedAction,
       latitude: parseFloat(row.latitude),
       longitude: parseFloat(row.longitude),
@@ -297,26 +426,69 @@ router.get('/clusters', async (req, res) => {
       complaints: row.complaints,
       latestAction: row.latestActionText
         ? {
-            text: row.latestActionText,
-            generatedBy: row.latestActionGeneratedBy,
-            status: row.latestActionStatus,
-            generatedAt: row.latestActionGeneratedAt,
-          }
+          text: row.latestActionText,
+          generatedBy: row.latestActionGeneratedBy,
+          status: row.latestActionStatus,
+          generatedAt: row.latestActionGeneratedAt,
+          retrievedContext: row.latestActionRetrievedContext,
+          confidenceScore: row.latestActionConfidenceScore != null ? parseFloat(row.latestActionConfidenceScore) : undefined,
+        }
         : null,
     }));
 
-    return res.status(200).json({ data: mapped });
+    const responsePayload = {
+      data: mapped,
+      meta: {
+        total: totalCount,
+        limit: limitVal,
+        offset: offsetVal,
+      },
+    };
+
+    // Cache the response
+    await cacheSet(cacheKey, responsePayload, 60);
+
+    return res.status(200).json(responsePayload);
   } catch (error) {
-    console.error('Error fetching clusters list:', error);
+    logger.error('Error fetching clusters list:', error);
     return res.status(500).json({
       error: 'An internal server error occurred while retrieving aggregated clusters.',
     });
   }
 });
 
-// POST /api/clusters/:id/status: Update status of a cluster and cascade status to complaints
-// Requires login + ngo/govt/admin role — citizens are read-only
+// POST /api/clusters/:id/status (DEPRECATED — use PATCH /api/clusters/:id/status instead)
+//
+// ⚠️  DEPRECATED as of CivicMind AI 2.0 — Phase 1.
+//     This route is kept only for backwards compatibility with any legacy clients
+//     that have not yet migrated to the PATCH endpoint.
+//
+//     Differences from the new PATCH route:
+//       • Does NOT enforce the cluster status state machine.
+//       • Does NOT write an action_log row (no audit trail).
+//       • Does NOT use SELECT … FOR UPDATE (no concurrency protection).
+//
+//     Migration path:
+//       Replace POST /api/clusters/:id/status { status }
+//       with  PATCH /api/clusters/:id/status { newStatus, note? }
+//
+//     This route will be REMOVED in CivicMind AI 2.0 — Phase 2.
+//
 router.post('/clusters/:id/status', authenticateToken, requireRole('ngo', 'govt', 'admin'), async (req, res) => {
+  // Emit deprecation headers so API consumers are alerted immediately
+  res.setHeader('Deprecation', 'true');
+  res.setHeader(
+    'Link',
+    '</api/clusters/:id/status>; rel="successor-version"; title="PATCH /api/clusters/:id/status"'
+  );
+  // NOTE: HTTP header values must be ISO-8859-1 (latin-1) only.
+  // Non-ASCII characters (e.g. em dashes) make Node throw
+  // "TypeError: Invalid character in header content", so keep this ASCII.
+  res.setHeader(
+    'Sunset',
+    'CivicMind AI 2.0 Phase 2 - this endpoint will be removed in the next release'
+  );
+
   try {
     const rawClusterId = req.params.id;
     const { status } = req.body;
@@ -325,8 +497,8 @@ router.post('/clusters/:id/status', authenticateToken, requireRole('ngo', 'govt'
       return res.status(503).json({ error: 'Database service is unavailable.' });
     }
 
-    if (!['pending', 'in_progress', 'resolved'].includes(status)) {
-      return res.status(400).json({ error: 'Invalid status value. Must be pending, in_progress, or resolved.' });
+    if (!['open', 'in_progress', 'resolved', 'escalated'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status value. Must be open, in_progress, resolved, or escalated.' });
     }
 
     // Extract numerical ID from "CL-[integer]" prefix
@@ -364,7 +536,7 @@ router.post('/clusters/:id/status', authenticateToken, requireRole('ngo', 'govt'
     });
   } catch (error) {
     if (pool) await pool.query('ROLLBACK');
-    console.error('Error updating cluster status:', error);
+    logger.error('Error updating cluster status:', error);
     return res.status(500).json({
       error: 'An internal server error occurred while updating cluster status.',
     });
@@ -391,7 +563,7 @@ router.get('/clusters/:id/actions', async (req, res) => {
     }
 
     const actionsRes = await pool.query(
-      `SELECT id, action_text, generated_by, status, generated_at
+      `SELECT id, action_text, generated_by, status, generated_at, retrieved_context, confidence_score
        FROM recommended_action
        WHERE cluster_id = $1
        ORDER BY generated_at DESC`,
@@ -403,7 +575,7 @@ router.get('/clusters/:id/actions', async (req, res) => {
       data: actionsRes.rows,
     });
   } catch (error) {
-    console.error('Error fetching cluster actions:', error);
+    logger.error('Error fetching cluster actions:', error);
     return res.status(500).json({
       error: 'An internal server error occurred while retrieving cluster actions.',
     });

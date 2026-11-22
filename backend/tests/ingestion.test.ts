@@ -235,12 +235,20 @@ describe('Ingestion Pipeline & Audit Logging Tests', () => {
   // ─── Service Account Authorization & Permission Isolation ────────────────
   describe('Service Account Security & Permissions', () => {
     it('should ALLOW Service Account to call POST /api/ingest/news', async () => {
+      const originalFetch = global.fetch;
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: async () => `<rss><channel><item><title>Mock pothole</title><description>Large pothole on Richmond road</description><link>http://news.example.com/1</link></item></channel></rss>`
+      }) as any;
+
       mockPool.query.mockResolvedValueOnce({ rows: [{ id: 1 }] }); // source lookup
       mockPool.query.mockResolvedValueOnce({ rows: [{ id: 505 }] }); // log insert
 
       const res = await request(app)
         .post('/api/ingest/news')
         .set('Authorization', `Bearer ${serviceAccountToken}`);
+
+      global.fetch = originalFetch;
 
       expect(res.status).toBe(200);
       expect(res.body.message).toBe('News RSS ingestion complete');
